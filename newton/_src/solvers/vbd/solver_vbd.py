@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import warp as wp
@@ -301,6 +301,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         particle_rest_shape_contact_exclusion_radius: float = 0.0,
         particle_external_vertex_contact_filtering_map: dict | None = None,
         particle_external_edge_contact_filtering_map: dict | None = None,
+        particle_initial_guess: Literal["inertia", "adaptive"] = "inertia",
         # Rigid body - constraint formulation and stabilization
         rigid_compliant_alm: bool | None = None,  # None retains legacy and emits the scoped migration warning
         rigid_avbd_alpha: float | None = None,  # Shared alpha override; None uses mode defaults
@@ -385,6 +386,15 @@ class SolverVBD(SolverBase, CouplingInterface):
             particle_external_edge_contact_filtering_map: Optional dictionary used to exclude additional edge-edge pairs during contact
                 generation. Keys must be edge primitive ids (integers), and each value must be a `list` or `set`
                 containing the edges to be filtered out. Only used when `particle_enable_self_contact` is `True`.
+            particle_initial_guess: Where each step's particle iteration starts. ``"inertia"`` (default)
+                starts at the inertial target ``x + (v + a dt) dt``. ``"adaptive"`` scales the external
+                acceleration ``a`` by how much of it each particle actually followed over the previous step
+                (Chen et al. 2024, *Vertex Block Descent*, adaptive initialization), so a particle at rest
+                on contact or held by elasticity starts at ``x + v dt``. With a fixed iteration count the
+                inertial start biases resting bodies: the truncated solve cannot get back to equilibrium
+                from a guess a full gravity step away, and damping (``k_damp``), which slows each
+                iteration, makes the stationary error larger. A soft column then rests visibly short of
+                its elastic height. ``"adaptive"`` removes that bias while free fall stays inertial.
 
             Rigid body parameters:
 
@@ -770,6 +780,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             particle_rest_shape_contact_exclusion_radius,
             particle_external_vertex_contact_filtering_map,
             particle_external_edge_contact_filtering_map,
+            particle_initial_guess,
         )
 
         # Initialize rigid body system and rigid-particle (body-particle) interaction state
@@ -816,11 +827,21 @@ class SolverVBD(SolverBase, CouplingInterface):
         particle_rest_shape_contact_exclusion_radius: float,
         particle_external_vertex_contact_filtering_map: dict | None,
         particle_external_edge_contact_filtering_map: dict | None,
+        particle_initial_guess: str = "inertia",
     ):
         """Initialize particle-specific data structures and settings."""
+        if particle_initial_guess not in ("inertia", "adaptive"):
+            raise ValueError(
+                f"particle_initial_guess must be 'inertia' or 'adaptive', got {particle_initial_guess!r}"
+            )
+        self.particle_initial_guess = particle_initial_guess
+        # Velocities at the start of the previous step, for the adaptive initial guess.
+        self.particle_qd_prev_step = None
         # Early exit if no particles
         if model.particle_count == 0:
             return
+        if particle_initial_guess == "adaptive":
+            self.particle_qd_prev_step = wp.clone(model.particle_qd, device=self.device)
 
         self.particle_collision_detection_interval = particle_collision_detection_interval
         self.particle_topological_contact_filter_threshold = particle_topological_contact_filter_threshold
@@ -2626,6 +2647,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 self.model.particle_inv_mass,
                 state_in.particle_f,
                 self.model.particle_flags,
+                self.particle_qd_prev_step,
             ],
             outputs=[
                 self.inertia,
