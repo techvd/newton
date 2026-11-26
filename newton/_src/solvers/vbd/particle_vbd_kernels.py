@@ -1209,6 +1209,24 @@ def forward_step(
 
 
 @wp.kernel
+def compute_speculative_particle_caps(
+    vel: wp.array[wp.vec3],
+    gravity: wp.array[wp.vec3],
+    particle_world: wp.array[wp.int32],
+    dt: float,
+    base_cap: float,
+    factor: float,
+    caps_out: wp.array[float],
+):
+    """Each particle's speculative self-contact cap: how far it may move this step, at least ``base_cap`` and
+    ``factor`` times its free move ``|v| dt + |g| dt^2``."""
+    i = wp.tid()
+    world = particle_world[i]
+    g = gravity[wp.max(world, 0)]
+    caps_out[i] = wp.max(base_cap, factor * (wp.length(vel[i]) * dt + wp.length(g) * dt * dt))
+
+
+@wp.kernel
 def mark_held_particle_groups(
     inv_mass: wp.array[float],
     particle_group: wp.array[wp.int32],
@@ -1224,20 +1242,28 @@ def mark_held_particle_groups(
 def mark_held_self_contact_groups(
     collision_info: TriMeshCollisionInfo,
     tri_indices: wp.array2d[wp.int32],
+    pos: wp.array[wp.vec3],
+    contact_radius: float,
     particle_group: wp.array[wp.int32],
     group_held: wp.array[wp.int32],
 ):
-    """Flag both sides of every vertex-triangle contact between two different groups. A body touching its own
-    surface (near-contacts within one body's surface are common on coarse meshes) is not held by it."""
+    """Flag both sides of every vertex-triangle contact between two different groups closer than ``contact_radius``.
+    A body touching its own surface (near-contacts within one body's surface are common on coarse meshes) is not held
+    by it, and a pair found ahead (speculative detection reaches further than contact) holds nothing yet."""
     vertex = wp.tid()
     count = get_vertex_colliding_triangles_count(collision_info, vertex)
     group = particle_group[vertex]
     for i in range(count):
         triangle = get_vertex_colliding_triangles(collision_info, vertex, i)
-        other = particle_group[tri_indices[triangle, 0]]
+        t0 = tri_indices[triangle, 0]
+        other = particle_group[t0]
         if other != group:
-            group_held[group] = 1
-            group_held[other] = 1
+            closest, _bary, _feature = triangle_closest_point(
+                pos[t0], pos[tri_indices[triangle, 1]], pos[tri_indices[triangle, 2]], pos[vertex]
+            )
+            if wp.length(closest - pos[vertex]) < contact_radius:
+                group_held[group] = 1
+                group_held[other] = 1
 
 
 @wp.kernel
@@ -2111,6 +2137,7 @@ def apply_truncation_ts(
     displacement_in: wp.array[wp.vec3],
     truncation_ts: wp.array[float],
     max_displacement: float,
+    max_displacements: wp.array[float],
     displacement_out: wp.array[wp.vec3],
     pos_out: wp.array[wp.vec3],
 ):
@@ -2118,10 +2145,14 @@ def apply_truncation_ts(
     t = truncation_ts[i]
     particle_displacement = displacement_in[i] * t
 
-    # Nuts-saving truncation: clamp displacement magnitude to max_displacement
+    # Nuts-saving truncation: clamp displacement magnitude to max_displacement, and to the particle's own
+    # limit when per-particle limits are given (speculative self-contact)
+    limit = max_displacement
+    if max_displacements:
+        limit = wp.min(limit, max_displacements[i])
     len_displacement = wp.length(particle_displacement)
-    if len_displacement > max_displacement:
-        particle_displacement = particle_displacement * max_displacement / len_displacement
+    if len_displacement > limit:
+        particle_displacement = particle_displacement * limit / len_displacement
 
     displacement_out[i] = particle_displacement
     if pos_out:

@@ -17,6 +17,7 @@ from .kernels import (
     compute_tri_aabbs,
     compute_tri_groups,
     edge_colliding_edges_detection_kernel,
+    expand_primitive_aabbs_by_cap,
     init_triangle_collision_data_kernel,
     triangle_triangle_collision_detection_kernel,
     vertex_triangle_collision_detection_kernel,
@@ -894,23 +895,33 @@ class TriMeshCollisionDetector:
             device=self.model.device,
         )
 
-    def refit(self, new_pos=None):
+    def refit(self, new_pos=None, particle_cap=None, cap_scale: float = 1.0):
+        """Refit the BVHs to ``new_pos``. With ``particle_cap`` (speculative detection), each triangle's and edge's
+        AABB also grows by its vertices' largest cap times ``cap_scale``."""
         if new_pos is not None:
             self.vertex_positions = new_pos
 
-        self.refit_triangles()
-        self.refit_edges()
+        self.refit_triangles(particle_cap, cap_scale)
+        self.refit_edges(particle_cap, cap_scale)
 
-    def refit_triangles(self):
+    def refit_triangles(self, particle_cap=None, cap_scale: float = 1.0):
         wp.launch(
             kernel=compute_tri_aabbs,
             inputs=[self.vertex_positions, self.model.tri_indices, self.lower_bounds_tris, self.upper_bounds_tris],
             dim=self.model.tri_count,
             device=self.model.device,
         )
+        if particle_cap is not None:
+            wp.launch(
+                kernel=expand_primitive_aabbs_by_cap,
+                inputs=[self.model.tri_indices, 0, 3, particle_cap, cap_scale, self.lower_bounds_tris,
+                        self.upper_bounds_tris],
+                dim=self.model.tri_count,
+                device=self.model.device,
+            )
         self.bvh_tris.refit()
 
-    def refit_edges(self):
+    def refit_edges(self, particle_cap=None, cap_scale: float = 1.0):
         if self.bvh_edges is None:
             return
         wp.launch(
@@ -919,11 +930,28 @@ class TriMeshCollisionDetector:
             dim=self.model.edge_count,
             device=self.model.device,
         )
+        if particle_cap is not None:
+            wp.launch(
+                kernel=expand_primitive_aabbs_by_cap,
+                inputs=[self.model.edge_indices, 2, 2, particle_cap, cap_scale, self.lower_bounds_edges,
+                        self.upper_bounds_edges],
+                dim=self.model.edge_count,
+                device=self.model.device,
+            )
         self.bvh_edges.refit()
 
     def vertex_triangle_collision_detection(
-        self, max_query_radius, min_query_radius=0.0, min_distance_filtering_ref_pos=None
+        self,
+        max_query_radius,
+        min_query_radius=0.0,
+        min_distance_filtering_ref_pos=None,
+        particle_cap=None,
+        particle_group=None,
+        cap_scale: float = 1.0,
     ):
+        """``particle_cap`` and ``particle_group`` (speculative detection, with :meth:`refit` given the same caps):
+        a pair between two groups is found out to ``(cap_a + cap_b) * cap_scale``, so neither side's capped move can
+        reach an undetected primitive of another group; pairs within one group keep ``max_query_radius``."""
         self._require_collision_info()
         self.vertex_colliding_triangles.fill_(-1)
 
@@ -962,6 +990,9 @@ class TriMeshCollisionDetector:
                 self.vertex_triangle_filtering_list,
                 self.vertex_triangle_filtering_list_offsets,
                 min_distance_filtering_ref_pos if min_distance_filtering_ref_pos is not None else self.vertex_positions,
+                particle_cap,
+                particle_group,
+                cap_scale,
             ],
             outputs=[
                 self.vertex_colliding_triangles,
@@ -983,8 +1014,17 @@ class TriMeshCollisionDetector:
         return self.collision_detection_block_size
 
     def edge_edge_collision_detection(
-        self, max_query_radius, min_query_radius=0.0, min_distance_filtering_ref_pos=None
+        self,
+        max_query_radius,
+        min_query_radius=0.0,
+        min_distance_filtering_ref_pos=None,
+        particle_cap=None,
+        particle_group=None,
+        cap_scale: float = 1.0,
     ):
+        """``particle_cap`` and ``particle_group`` (speculative detection, with :meth:`refit` given the same caps):
+        a pair between two groups is found out to ``(cap_a + cap_b) * cap_scale``, so neither side's capped move can
+        reach an undetected primitive of another group; pairs within one group keep ``max_query_radius``."""
         self._require_collision_info()
         self.edge_colliding_edges.fill_(-1)
         if self.bvh_edges is None:
@@ -1006,6 +1046,9 @@ class TriMeshCollisionDetector:
                 self.edge_filtering_list,
                 self.edge_filtering_list_offsets,
                 min_distance_filtering_ref_pos if min_distance_filtering_ref_pos is not None else self.vertex_positions,
+                particle_cap,
+                particle_group,
+                cap_scale,
             ],
             outputs=[
                 self.edge_colliding_edges,

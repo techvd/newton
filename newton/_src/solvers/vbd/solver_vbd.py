@@ -63,6 +63,7 @@ from .particle_vbd_kernels import (
     apply_planar_truncation_parallel_by_collision,
     apply_truncation_ts,
     build_particle_body_contact_adjacency_active,
+    compute_speculative_particle_caps,
     # Solver kernels (particle VBD)
     forward_step,
     mark_held_contact_groups,
@@ -220,6 +221,11 @@ def _validate_compliant_alm_material_coefficient(
     if np.any(values > np.finfo(np.float32).max):
         raise ValueError(f"{name} must not exceed the float32 maximum")
 
+
+# Speculative self-contact: a particle's cap is this many times its free move this step. Above 1 so a free particle
+# is never clipped; small because pairs grow with the square of the reach (a larger factor overflows the contact
+# buffers near impacts, and overflow shrinks the caps, which brakes the bodies).
+_SPECULATIVE_CAP_FACTOR = 1.25
 
 def _particle_groups(model: Model) -> np.ndarray:
     """Connected-component label (0..groups-1) of every particle, joined by tets, triangles, edges and springs."""
@@ -494,6 +500,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         particle_external_vertex_contact_filtering_map: dict | None = None,
         particle_external_edge_contact_filtering_map: dict | None = None,
         particle_initial_guess: Literal["inertia", "adaptive"] = "inertia",
+        particle_self_contact_speculative: bool = False,
         # Rigid body - constraint formulation and stabilization
         rigid_compliant_alm: bool = _DEPRECATED_RIGID_COMPLIANT_ALM_UNSET,
         rigid_avbd_alpha: float | None = None,  # Shared alpha override; None uses zero
@@ -612,6 +619,16 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 self-contact with another body). A free body starts at the inertial target, which is exact in
                 free flight; a stiff body's truncated solve would otherwise fall short of gravity and the
                 measured acceleration would carry that shortfall into the next step.
+            particle_self_contact_speculative: With self-contact, the penetration-free solve limits every
+                particle's move per step to ``(particle_self_contact_margin + particle_self_contact_gap) *
+                dat_conservative_bound_relaxation / 2``, since contacts are only detected within that query
+                radius; at a coarse step that caps every particle's speed, also far from anything. With this option
+                each particle's limit grows with its own free move (``1.25 (|v| dt + |g| dt^2)``, at least the fixed
+                limit), and contacts between two different connected bodies are detected out to the sum of both
+                sides' limits divided by the relaxation, so neither can reach a primitive of another body it did not
+                detect. Contacts within one body keep the fixed query radius, so a body folding onto itself faster
+                than the fixed limit is not guaranteed penetration-free. Requires VBD's own self-contact detector
+                (no ``collision_pipeline``).
 
             rigid_compliant_alm: Deprecated; omit it. Compliant ALM is always used for
                 body-body contacts, structural joints, drives, and limits. Explicit
@@ -1081,6 +1098,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             particle_external_edge_contact_filtering_map,
             enable_fast_math,
             particle_initial_guess,
+            particle_self_contact_speculative,
         )
 
         # Routed tendon geometry and material state are shared with XPBD; VBD
@@ -1181,6 +1199,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         particle_external_edge_contact_filtering_map: dict | None,
         enable_fast_math: bool,
         particle_initial_guess: str = "inertia",
+        particle_self_contact_speculative: bool = False,
     ):
         """Initialize particle-specific data structures and settings."""
         if particle_initial_guess not in ("inertia", "adaptive"):
@@ -1190,17 +1209,27 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self.particle_initial_guess = particle_initial_guess
         # Velocities at the start of the previous step, for the adaptive initial guess.
         self.particle_qd_prev_step = None
-        # Early exit if no particles
-        if model.particle_count == 0:
-            return
         # Adaptive guess: one group per connected body, flagged each step when something holds it.
         self.particle_group = None
         self.particle_group_held = None
-        if particle_initial_guess == "adaptive":
-            self.particle_qd_prev_step = wp.clone(model.particle_qd, device=self.device)
+        self.particle_self_contact_speculative = bool(
+            particle_self_contact_speculative and self.particle_enable_self_contact and model.particle_count > 0
+        )
+        self.particle_speculative_caps = None
+        # Early exit if no particles
+        if model.particle_count == 0:
+            return
+        if self.particle_self_contact_speculative and self.collision_pipeline is not None:
+            raise ValueError("particle_self_contact_speculative needs VBD's own self-contact detector (no collision_pipeline)")
+        if particle_initial_guess == "adaptive" or self.particle_self_contact_speculative:
             groups = _particle_groups(model)
             self.particle_group = wp.array(groups, dtype=wp.int32, device=self.device)
+        if particle_initial_guess == "adaptive":
+            self.particle_qd_prev_step = wp.clone(model.particle_qd, device=self.device)
             self.particle_group_held = wp.zeros(int(groups.max()) + 1, dtype=wp.int32, device=self.device)
+        if self.particle_self_contact_speculative:
+            self.particle_speculative_caps = wp.zeros(model.particle_count, dtype=float, device=self.device)
+        self._particle_step_dt = 0.0
 
         self.particle_collision_detection_interval = particle_collision_detection_interval
         self.particle_topological_contact_filter_threshold = particle_topological_contact_filter_threshold
@@ -2775,6 +2804,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 )
         self._require_unreduced_contacts(contacts)
         self._apply_module_options()
+        self._particle_step_dt = dt
         update_rigid = self._update_rigid_history
         self._update_rigid_history = True
 
@@ -3423,7 +3453,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
 
         if self.model.particle_count > 0:
             max_displacement = self._rigid_dat_particle_max_displacement
-            if self.particle_enable_self_contact:
+            if self.particle_enable_self_contact and not self.particle_self_contact_speculative:
                 max_displacement = min(
                     max_displacement,
                     self._self_contact_query_radius * self.dat_conservative_bound_relaxation * 0.5,
@@ -3436,6 +3466,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.particle_displacements,
                     self.truncation_ts,
                     max_displacement,
+                    self.particle_speculative_caps,  # per particle in speculative mode, else None
                 ],
                 outputs=[
                     self.particle_displacements,
@@ -3479,7 +3510,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         # Max displacement between collision detections (0.5 * gamma * detection slack
         # per side); displacements beyond it degenerate to isotropic truncation.
         max_displacement = wp.inf
-        if self.particle_enable_self_contact:
+        if self.particle_enable_self_contact and not self.particle_self_contact_speculative:
             max_displacement = self._self_contact_query_radius * self.dat_conservative_bound_relaxation * 0.5
         if rigid_dat_active:
             max_displacement = min(max_displacement, self._rigid_dat_particle_max_displacement)
@@ -3547,6 +3578,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 self.particle_displacements,
                 self.truncation_ts,
                 max_displacement,
+                self.particle_speculative_caps,  # per particle in speculative mode, else None
             ],
             outputs=[
                 self.particle_displacements,
@@ -3644,7 +3676,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             wp.launch(
                 kernel=mark_held_self_contact_groups,
                 dim=model.particle_count,
-                inputs=[self.trimesh_collision_info, model.tri_indices, self.particle_group, held],
+                inputs=[self.trimesh_collision_info, model.tri_indices, self.pos_prev_collision_detection,
+                        self._self_contact_query_radius, self.particle_group, held],
                 device=self.device,
             )
         if (
@@ -5485,6 +5518,34 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
 
         if self.collision_pipeline is not None:
             self.collision_pipeline._detect_soft_self_contact(current_state.particle_q, self._pipeline_contacts)
+        elif self.particle_self_contact_speculative:
+            relaxation = self.dat_conservative_bound_relaxation
+            wp.launch(
+                kernel=compute_speculative_particle_caps,
+                dim=self.model.particle_count,
+                inputs=[
+                    current_state.particle_qd,
+                    self.model.gravity,
+                    self.model.particle_world,
+                    self._particle_step_dt,
+                    self._self_contact_query_radius * relaxation * 0.5,
+                    _SPECULATIVE_CAP_FACTOR,
+                ],
+                outputs=[self.particle_speculative_caps],
+                device=self.device,
+            )
+            caps, scale = self.particle_speculative_caps, 1.0 / relaxation
+            detector = self.trimesh_collision_detector
+            detector.refit(current_state.particle_q, particle_cap=caps, cap_scale=scale)
+            for detect in (detector.vertex_triangle_collision_detection, detector.edge_edge_collision_detection):
+                detect(
+                    self._self_contact_query_radius,
+                    min_query_radius=self.particle_rest_shape_contact_exclusion_radius,
+                    min_distance_filtering_ref_pos=self.particle_q_rest,
+                    particle_cap=caps,
+                    particle_group=self.particle_group,
+                    cap_scale=scale,
+                )
         else:
             self.trimesh_collision_detector.refit(current_state.particle_q)
             self.trimesh_collision_detector.vertex_triangle_collision_detection(
