@@ -1466,15 +1466,18 @@ def mark_held_self_contact_groups(
     particle_group: wp.array[wp.int32],
     group_held: wp.array[wp.int32],
 ):
-    """Flag both sides of every vertex-triangle self-contact: the vertex's group and the triangle's."""
+    """Flag both sides of every vertex-triangle contact between two different groups. A body touching its own
+    surface (near-contacts within one body's surface are common on coarse meshes) is not held by it."""
     vertex = wp.tid()
     collision_info = collision_info_array[0]
     count = get_vertex_colliding_triangles_count(collision_info, vertex)
-    if count > 0:
-        group_held[particle_group[vertex]] = 1
+    group = particle_group[vertex]
     for i in range(count):
         triangle = get_vertex_colliding_triangles(collision_info, vertex, i)
-        group_held[particle_group[tri_indices[triangle, 0]]] = 1
+        other = particle_group[tri_indices[triangle, 0]]
+        if other != group:
+            group_held[group] = 1
+            group_held[other] = 1
 
 
 @wp.kernel

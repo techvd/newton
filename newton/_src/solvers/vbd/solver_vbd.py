@@ -428,7 +428,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 its elastic height. ``"adaptive"`` removes that bias while free fall stays inertial: the
                 scaling applies only to particles of a connected body (joined by tets, triangles, edges or
                 springs) that something holds this step (a fixed particle, a body-particle contact or a
-                self-contact). A free body starts at the inertial target, which is exact in free flight; a
+                self-contact with another body). A free body starts at the inertial target, which is exact in free flight; a
                 stiff body's truncated solve would otherwise fall short of gravity and the measured
                 acceleration would carry that shortfall into the next step.
 
