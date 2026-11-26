@@ -2727,13 +2727,13 @@ class SolverVBD(SolverBase, CouplingInterface):
         if (
             contacts is not None
             and contacts.soft_contact_count is not None
-            and contacts.soft_contact_particle is not None
-            and contacts.soft_contact_particle.shape[0] > 0
+            and contacts.soft_contact_indices is not None
+            and contacts.soft_contact_indices.shape[0] > 0
         ):
             wp.launch(
                 kernel=mark_held_contact_groups,
-                dim=contacts.soft_contact_particle.shape[0],
-                inputs=[contacts.soft_contact_count, contacts.soft_contact_particle, self.particle_group, held],
+                dim=contacts.soft_contact_indices.shape[0],
+                inputs=[contacts.soft_contact_count, contacts.soft_contact_indices, self.particle_group, held],
                 device=self.device,
             )
 

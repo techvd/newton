@@ -1480,14 +1480,17 @@ def mark_held_self_contact_groups(
 @wp.kernel
 def mark_held_contact_groups(
     soft_contact_count: wp.array[wp.int32],
-    soft_contact_particle: wp.array[wp.int32],
+    soft_contact_indices: wp.array[wp.vec3i],
     particle_group: wp.array[wp.int32],
     group_held: wp.array[wp.int32],
 ):
-    """Flag the group of every particle in a body-particle contact."""
+    """Flag the group of every soft feature in a body-particle contact (particle, edge or face record: the
+    first index is always a particle of the feature)."""
     contact = wp.tid()
     if contact < soft_contact_count[0]:
-        group_held[particle_group[soft_contact_particle[contact]]] = 1
+        particle = soft_contact_indices[contact][0]
+        if particle >= 0:
+            group_held[particle_group[particle]] = 1
 
 
 @wp.kernel
