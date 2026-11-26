@@ -1424,6 +1424,9 @@ def vertex_triangle_collision_detection_kernel(
     vertex_triangle_filtering_list: wp.array[wp.int32],
     vertex_triangle_filtering_list_offsets: wp.array[wp.int32],
     min_distance_filtering_ref_pos: wp.array[wp.vec3],
+    particle_cap: wp.array[float],
+    particle_group: wp.array[wp.int32],
+    cap_scale: float,
     # outputs
     vertex_colliding_triangles: wp.array[wp.int32],
     vertex_colliding_triangles_count: wp.array[wp.int32],
@@ -1472,8 +1475,13 @@ def vertex_triangle_collision_detection_kernel(
     vertex_buffer_offset = vertex_colliding_triangles_offsets[v_index]
     vertex_buffer_size = vertex_colliding_triangles_offsets[v_index + 1] - vertex_buffer_offset
 
-    lower = wp.vec3(v[0] - max_query_radius, v[1] - max_query_radius, v[2] - max_query_radius)
-    upper = wp.vec3(v[0] + max_query_radius, v[1] + max_query_radius, v[2] + max_query_radius)
+    # Speculative mode (``particle_cap``): each particle may move up to its cap this step, and the triangle AABBs
+    # were expanded by their vertices' largest cap times ``cap_scale``, so a vertex queries its own cap's reach.
+    half = max_query_radius
+    if particle_cap:
+        half = particle_cap[v_index] * cap_scale
+    lower = wp.vec3(v[0] - half, v[1] - half, v[2] - half)
+    upper = wp.vec3(v[0] + half, v[1] + half, v[2] + half)
 
     tri_index = wp.int32(0)
     vertex_num_collisions = wp.int32(0)
@@ -1551,7 +1559,14 @@ def vertex_triangle_collision_detection_kernel(
                     if dist_ref < min_query_radius:
                         continue
 
-                if dist < max_query_radius:
+                pair_radius = max_query_radius
+                if particle_cap:
+                    if particle_group[v_index] != particle_group[t1]:
+                        # Between two bodies: far enough that both sides' caps together cannot close the gap.
+                        tri_cap = wp.max(particle_cap[t1], wp.max(particle_cap[t2], particle_cap[t3]))
+                        pair_radius = wp.max(max_query_radius, (particle_cap[v_index] + tri_cap) * cap_scale)
+
+                if dist < pair_radius:
                     # record v-f collision to vertex
                     min_dis_to_tris = wp.min(min_dis_to_tris, dist)
                     if vertex_num_collisions < vertex_buffer_size:
@@ -1559,6 +1574,14 @@ def vertex_triangle_collision_detection_kernel(
                         vertex_colliding_triangles[2 * (vertex_buffer_offset + vertex_num_collisions) + 1] = tri_index
                     else:
                         resize_flags[VERTEX_COLLISION_BUFFER_OVERFLOW_INDEX] = 1
+                        if particle_cap:
+                            # A dropped pair is unseen by the truncation: shrink both sides' caps so this step's
+                            # capped moves cannot close it (each at most half the distance, relaxed).
+                            shrink = dist / (2.0 * cap_scale)
+                            wp.atomic_min(particle_cap, v_index, shrink)
+                            wp.atomic_min(particle_cap, t1, shrink)
+                            wp.atomic_min(particle_cap, t2, shrink)
+                            wp.atomic_min(particle_cap, t3, shrink)
 
                     vertex_num_collisions = vertex_num_collisions + 1
 
@@ -1594,6 +1617,9 @@ def edge_colliding_edges_detection_kernel(
     edge_filtering_list: wp.array[wp.int32],
     edge_filtering_list_offsets: wp.array[wp.int32],
     min_distance_filtering_ref_pos: wp.array[wp.vec3],
+    particle_cap: wp.array[float],
+    particle_group: wp.array[wp.int32],
+    cap_scale: float,
     # outputs
     edge_colliding_edges: wp.array[wp.int32],
     edge_colliding_edges_count: wp.array[wp.int32],
@@ -1628,8 +1654,13 @@ def edge_colliding_edges_detection_kernel(
     lower = wp.min(e0_v0_pos, e0_v1_pos)
     upper = wp.max(e0_v0_pos, e0_v1_pos)
 
-    lower = wp.vec3(lower[0] - max_query_radius, lower[1] - max_query_radius, lower[2] - max_query_radius)
-    upper = wp.vec3(upper[0] + max_query_radius, upper[1] + max_query_radius, upper[2] + max_query_radius)
+    half = max_query_radius
+    edge_cap = float(0.0)
+    if particle_cap:  # speculative mode: the edge AABBs were expanded by their caps times cap_scale
+        edge_cap = wp.max(particle_cap[e0_v0], particle_cap[e0_v1])
+        half = edge_cap * cap_scale
+    lower = wp.vec3(lower[0] - half, lower[1] - half, lower[2] - half)
+    upper = wp.vec3(upper[0] + half, upper[1] + half, upper[2] + half)
 
     colliding_edge_index = wp.int32(0)
     edge_num_collisions = wp.int32(0)
@@ -1703,7 +1734,13 @@ def edge_colliding_edges_detection_kernel(
                     if dist_ref < min_query_radius:
                         continue
 
-                if dist < max_query_radius:
+                pair_radius = max_query_radius
+                if particle_cap:
+                    if particle_group[e0_v0] != particle_group[e1_v0]:
+                        other_cap = wp.max(particle_cap[e1_v0], particle_cap[e1_v1])
+                        pair_radius = wp.max(max_query_radius, (edge_cap + other_cap) * cap_scale)
+
+                if dist < pair_radius:
                     edge_buffer_offset = edge_colliding_edges_offsets[e_index]
                     edge_buffer_size = edge_colliding_edges_offsets[e_index + 1] - edge_buffer_offset
 
@@ -1714,6 +1751,12 @@ def edge_colliding_edges_detection_kernel(
                         edge_colliding_edges[2 * (edge_buffer_offset + edge_num_collisions) + 1] = colliding_edge_index
                     else:
                         resize_flags[EDGE_COLLISION_BUFFER_OVERFLOW_INDEX] = 1
+                        if particle_cap:  # as for vertex-triangle: a dropped pair shrinks its four caps
+                            shrink = dist / (2.0 * cap_scale)
+                            wp.atomic_min(particle_cap, e0_v0, shrink)
+                            wp.atomic_min(particle_cap, e0_v1, shrink)
+                            wp.atomic_min(particle_cap, e1_v0, shrink)
+                            wp.atomic_min(particle_cap, e1_v1, shrink)
 
                     edge_num_collisions = edge_num_collisions + 1
 
@@ -1777,3 +1820,23 @@ def triangle_triangle_collision_detection_kernel(
 
 
 # endregion
+
+
+@wp.kernel
+def expand_primitive_aabbs_by_cap(
+    primitive_indices: wp.array2d[wp.int32],
+    first_column: int,
+    column_count: int,
+    particle_cap: wp.array[float],
+    cap_scale: float,
+    lower: wp.array[wp.vec3],
+    upper: wp.array[wp.vec3],
+):
+    """Grow each triangle's or edge's AABB by its vertices' largest speculative cap times ``cap_scale``."""
+    i = wp.tid()
+    cap = float(0.0)
+    for c in range(column_count):
+        cap = wp.max(cap, particle_cap[primitive_indices[i, first_column + c]])
+    grow = cap * cap_scale
+    lower[i] = lower[i] - wp.vec3(grow, grow, grow)
+    upper[i] = upper[i] + wp.vec3(grow, grow, grow)

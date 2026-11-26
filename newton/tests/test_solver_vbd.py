@@ -4638,5 +4638,57 @@ def _particle_initial_guess(test, device):
 
 add_function_test(TestSolverVBD, "test_particle_initial_guess", _particle_initial_guess, devices=devices)
 
+
+def _cube_over_plate(device):
+    """A 6 cm soft cube 1.5 m above a 30 x 2 x 30 cm soft plate fixed at two edges."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, -9.81, 0.0))
+    common = {"rot": wp.quat_identity(), "vel": wp.vec3(0.0, 0.0, 0.0), "density": 1000.0, "k_mu": 1.0e5,
+              "k_lambda": 1.0e5, "k_damp": 0.0}
+    builder.add_soft_grid(pos=wp.vec3(-0.15, 0.0, -0.15), dim_x=10, dim_y=1, dim_z=10, cell_x=0.03, cell_y=0.02,
+                          cell_z=0.03, fix_left=True, fix_right=True, **common)
+    builder.add_soft_grid(pos=wp.vec3(-0.03, 1.52, -0.03), dim_x=3, dim_y=3, dim_z=3, cell_x=0.02, cell_y=0.02,
+                          cell_z=0.02, **common)
+    builder.color()
+    return builder.finalize(device=device)
+
+
+def _particle_self_contact_speculative(test, device):
+    """With self-contact, the penetration-free solve limits every particle's move per contact detection to half the
+    query radius times the relaxation (here 2.55 mm; detection runs before and after the initial guess, so about
+    3 m/s at dt = 1/600 s), also for a body falling through empty space. ``particle_self_contact_speculative`` lets each particle move as far as its own speed takes it and finds
+    contacts with other bodies that far ahead: the cube falls as in free fall and still lands on the plate."""
+    dt = 1.0 / 600.0
+    model = _cube_over_plate(device)
+    cube = np.arange(model.particle_count)[model.particle_q.numpy()[:, 1] > 0.5]
+    start = model.particle_q.numpy()[cube, 1].mean()
+
+    def fallen(speculative: bool, steps: int) -> np.ndarray:
+        solver = newton.solvers.SolverVBD(
+            model,
+            iterations=10,
+            particle_enable_self_contact=True,
+            particle_self_contact_margin=0.002,
+            particle_self_contact_gap=0.004,
+            particle_self_contact_speculative=speculative,
+        )
+        return _run_particles(model, solver, steps=steps, dt=dt)
+
+    expected = 0.5 * 9.81 * (300 * dt) ** 2  # 0.5 s: 1.23 m, still in the air (4.9 m/s)
+    capped = start - fallen(False, 300)[cube, 1].mean()
+    test.assertLess(capped, 0.9 * expected)  # the cap
+    free = start - fallen(True, 300)[cube, 1].mean()
+    test.assertAlmostEqual(free, expected, delta=0.02 * expected)
+
+    landed = fallen(True, 480)  # 0.8 s: landed at 5.4 m/s (1.5 m takes 0.55 s)
+    test.assertTrue(np.isfinite(landed).all())
+    plate = np.setdiff1d(np.arange(model.particle_count), cube)
+    # Never through the plate: the cube's lowest point stays above the plate's bottom face.
+    test.assertGreater(landed[cube, 1].min(), landed[plate, 1].min())
+
+
+add_function_test(
+    TestSolverVBD, "test_particle_self_contact_speculative", _particle_self_contact_speculative, devices=devices
+)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, failfast=True)

@@ -1448,6 +1448,24 @@ def forward_step(
 
 
 @wp.kernel
+def compute_speculative_particle_caps(
+    vel: wp.array[wp.vec3],
+    gravity: wp.array[wp.vec3],
+    particle_world: wp.array[wp.int32],
+    dt: float,
+    base_cap: float,
+    factor: float,
+    caps_out: wp.array[float],
+):
+    """Each particle's speculative self-contact cap: how far it may move this step, at least ``base_cap`` and
+    ``factor`` times its free move ``|v| dt + |g| dt^2``."""
+    i = wp.tid()
+    world = particle_world[i]
+    g = gravity[wp.max(world, 0)]
+    caps_out[i] = wp.max(base_cap, factor * (wp.length(vel[i]) * dt + wp.length(g) * dt * dt))
+
+
+@wp.kernel
 def mark_held_particle_groups(
     inv_mass: wp.array[float],
     particle_group: wp.array[wp.int32],
@@ -2394,6 +2412,7 @@ def apply_truncation_ts(
     displacement_in: wp.array[wp.vec3],
     truncation_ts: wp.array[float],
     max_displacement: float,
+    max_displacements: wp.array[float],
     displacement_out: wp.array[wp.vec3],
     pos_out: wp.array[wp.vec3],
 ):
@@ -2401,10 +2420,13 @@ def apply_truncation_ts(
     t = truncation_ts[i]
     particle_displacement = displacement_in[i] * t
 
-    # Nuts-saving truncation: clamp displacement magnitude to max_displacement
+    # Nuts-saving truncation: clamp displacement magnitude to max_displacement (per particle when given)
+    limit = max_displacement
+    if max_displacements:
+        limit = max_displacements[i]
     len_displacement = wp.length(particle_displacement)
-    if len_displacement > max_displacement:
-        particle_displacement = particle_displacement * max_displacement / len_displacement
+    if len_displacement > limit:
+        particle_displacement = particle_displacement * limit / len_displacement
 
     displacement_out[i] = particle_displacement
     if pos_out:
