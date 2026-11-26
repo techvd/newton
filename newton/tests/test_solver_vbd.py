@@ -4690,5 +4690,59 @@ add_function_test(
     TestSolverVBD, "test_particle_self_contact_speculative", _particle_self_contact_speculative, devices=devices
 )
 
+
+def _jittered_block(device):
+    """A soft 12 cm block on a 2 cm tet grid with its nodes jittered (fixed seed), so the mesh has no symmetry,
+    starting 2 cm above a frictionless ground plane."""
+    grid = newton.ModelBuilder(up_axis=newton.Axis.Y)
+    grid.add_soft_grid(pos=wp.vec3(0.0, 0.0, 0.0), rot=wp.quat_identity(), vel=wp.vec3(0.0, 0.0, 0.0), dim_x=6,
+                       dim_y=6, dim_z=6, cell_x=0.02, cell_y=0.02, cell_z=0.02, density=50.0, k_mu=4.0e3,
+                       k_lambda=6.0e3, k_damp=25.0)
+    points = np.array(grid.particle_q, dtype=np.float64)
+    rng = np.random.default_rng(7)
+    points += rng.uniform(-0.005, 0.005, points.shape)
+    points[:, 1] += 0.02 - points[:, 1].min()
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, -9.81, 0.0))
+    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.0))
+    builder.add_soft_mesh(pos=wp.vec3(0.0, 0.0, 0.0), rot=wp.quat_identity(), scale=1.0, vel=wp.vec3(0.0, 0.0, 0.0),
+                          vertices=[wp.vec3(*p) for p in points], indices=np.asarray(grid.tet_indices).reshape(-1).tolist(),
+                          density=50.0, k_mu=4.0e3, k_lambda=6.0e3, k_damp=25.0, particle_radius=0.001)
+    builder.color()
+    model = builder.finalize(device=device)
+    model.soft_contact_ke = 2.0e4
+    model.soft_contact_mu = 0.0
+    return model
+
+
+def _particle_rigid_mode_correction(test, device):
+    """A truncated Gauss-Seidel solve converges slowest on a body's rigid motion. Dropped straight onto frictionless
+    ground, an asymmetric mesh at ten iterations leaves a net sideways residual every contact step, so the block
+    slides away although nothing pushes it sideways. ``particle_rigid_mode_correction`` re-solves each body's six
+    rigid degrees of freedom against its inertia and contact after the iterations: the block stays put."""
+    dt = 1.0 / 600.0
+    model = _jittered_block(device)
+    mass = model.particle_mass.numpy()
+
+    def sideways_speed(correction: bool) -> float:
+        solver = newton.solvers.SolverVBD(model, iterations=10, particle_rigid_mode_correction=correction)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.004)
+        contacts = pipeline.contacts()
+        state, following, control = model.state(), model.state(), model.control()
+        for _ in range(360):  # 0.6 s: lands at about 0.06 s
+            state.clear_forces()
+            pipeline.collide(state, contacts)
+            solver.step(state, following, control, contacts, dt)
+            state, following = following, state
+        velocity = (mass[:, None] * state.particle_qd.numpy()).sum(axis=0) / mass.sum()
+        return float(np.hypot(velocity[0], velocity[2]))
+
+    test.assertGreater(sideways_speed(False), 0.005)  # the drift the option removes
+    test.assertLess(sideways_speed(True), 0.0005)
+
+
+add_function_test(
+    TestSolverVBD, "test_particle_rigid_mode_correction", _particle_rigid_mode_correction, devices=devices
+)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, failfast=True)

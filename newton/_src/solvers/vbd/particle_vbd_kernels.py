@@ -1448,6 +1448,192 @@ def forward_step(
 
 
 @wp.kernel
+def rigid_mode_accumulate_mass(
+    pos: wp.array[wp.vec3],
+    particle_mass: wp.array[float],
+    inv_mass: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    particle_group: wp.array[wp.int32],
+    group_mass: wp.array[float],
+    group_moment: wp.array[wp.vec3],
+    group_fixed: wp.array[wp.int32],
+):
+    """Each group's mass and first moment; a group with a fixed (zero inverse mass) particle is held, not moved."""
+    i = wp.tid()
+    if not particle_flags[i] & ParticleFlags.ACTIVE:
+        return
+    g = particle_group[i]
+    if inv_mass[i] == 0.0:
+        group_fixed[g] = 1
+        return
+    m = particle_mass[i]
+    wp.atomic_add(group_mass, g, m)
+    wp.atomic_add(group_moment, g, m * pos[i])
+
+
+@wp.kernel
+def rigid_mode_mark_coupled(
+    collision_info_array: wp.array[TriMeshCollisionInfo],
+    tri_indices: wp.array2d[wp.int32],
+    particle_group: wp.array[wp.int32],
+    group_fixed: wp.array[wp.int32],
+    group_coupled: wp.array[wp.int32],
+):
+    """Flag groups in self-contact with another free group. Their rigid corrections would each be solved against the
+    other's unmoved positions through stiff contact and friction, which does not settle (measured: a cube resting on
+    a soft slab keeps jittering at 1-2 cm/s, also with halved steps), so they are left as solved."""
+    vertex = wp.tid()
+    collision_info = collision_info_array[0]
+    count = get_vertex_colliding_triangles_count(collision_info, vertex)
+    group = particle_group[vertex]
+    for i in range(count):
+        other = particle_group[tri_indices[get_vertex_colliding_triangles(collision_info, vertex, i), 0]]
+        if other != group and group_fixed[group] == 0 and group_fixed[other] == 0:
+            group_coupled[group] = 1
+            group_coupled[other] = 1
+
+
+@wp.func
+def _skew(r: wp.vec3):
+    return wp.mat33(0.0, -r[2], r[1], r[2], 0.0, -r[0], -r[1], r[0], 0.0)
+
+
+@wp.kernel
+def rigid_mode_accumulate_system(
+    dt: float,
+    pos: wp.array[wp.vec3],
+    inertia: wp.array[wp.vec3],
+    particle_mass: wp.array[float],
+    inv_mass: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    particle_group: wp.array[wp.int32],
+    forces: wp.array[wp.vec3],
+    hessians: wp.array[wp.mat33],
+    group_mass: wp.array[float],
+    group_moment: wp.array[wp.vec3],
+    group_hessian: wp.array[wp.spatial_matrix],
+    group_gradient: wp.array[wp.spatial_vector],
+):
+    """Each group's Newton system on its rigid motion (translation t, rotation w about its centre of mass):
+    ``x_i += t + w x r_i``. The elastic energy does not change under rigid motion, so only the inertia term and the
+    contact forces (``forces``/``hessians``, evaluated at ``pos``) enter: H = sum J^T (m/dt^2 + H_c) J,
+    g = sum J^T (m (x - y)/dt^2 - f_c), with J = [I, -[r]x]."""
+    i = wp.tid()
+    if not particle_flags[i] & ParticleFlags.ACTIVE or inv_mass[i] == 0.0:
+        return
+    g = particle_group[i]
+    total = group_mass[g]
+    if total <= 0.0:
+        return
+    m = particle_mass[i]
+    r = pos[i] - group_moment[g] / total
+    k = wp.identity(3, float) * (m / (dt * dt)) + hessians[i]
+    res = m * (pos[i] - inertia[i]) / (dt * dt) - forces[i]
+    s = _skew(r)
+    b = -(k * s)  # K J_w, with J_w = -[r]x
+    d = wp.transpose(s) * k * s  # J_w^T K J_w
+    h = wp.spatial_matrix(
+        k[0, 0], k[0, 1], k[0, 2], b[0, 0], b[0, 1], b[0, 2],
+        k[1, 0], k[1, 1], k[1, 2], b[1, 0], b[1, 1], b[1, 2],
+        k[2, 0], k[2, 1], k[2, 2], b[2, 0], b[2, 1], b[2, 2],
+        b[0, 0], b[1, 0], b[2, 0], d[0, 0], d[0, 1], d[0, 2],
+        b[0, 1], b[1, 1], b[2, 1], d[1, 0], d[1, 1], d[1, 2],
+        b[0, 2], b[1, 2], b[2, 2], d[2, 0], d[2, 1], d[2, 2],
+    )
+    torque = wp.cross(r, res)  # J_w^T res = -[r]x^T res = r x res
+    wp.atomic_add(group_hessian, g, h)
+    wp.atomic_add(group_gradient, g, wp.spatial_vector(res[0], res[1], res[2], torque[0], torque[1], torque[2]))
+
+
+@wp.kernel
+def rigid_mode_solve(
+    group_hessian: wp.array[wp.spatial_matrix],
+    group_gradient: wp.array[wp.spatial_vector],
+    group_mass: wp.array[float],
+    group_fixed: wp.array[wp.int32],
+    group_delta: wp.array[wp.spatial_vector],
+):
+    """delta = -H^-1 g per group (Gaussian elimination with partial pivoting); zero for held or empty groups."""
+    g = wp.tid()
+    group_delta[g] = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    if group_fixed[g] != 0 or group_mass[g] <= 0.0:
+        return
+    a = group_hessian[g]
+    rhs = -group_gradient[g]
+    scale = float(0.0)
+    for i in range(6):
+        scale = wp.max(scale, wp.abs(a[i, i]))
+    if scale <= 0.0:
+        return
+    for col in range(6):
+        pivot = col
+        best = wp.abs(a[col, col])
+        for row in range(col + 1, 6):
+            if wp.abs(a[row, col]) > best:
+                best = wp.abs(a[row, col])
+                pivot = row
+        if best <= 1.0e-12 * scale:
+            return
+        if pivot != col:
+            for j in range(6):
+                tmp = a[col, j]
+                a[col, j] = a[pivot, j]
+                a[pivot, j] = tmp
+            tmp_r = rhs[col]
+            rhs[col] = rhs[pivot]
+            rhs[pivot] = tmp_r
+        for row in range(col + 1, 6):
+            factor = a[row, col] / a[col, col]
+            for j in range(col, 6):
+                a[row, j] = a[row, j] - factor * a[col, j]
+            rhs[row] = rhs[row] - factor * rhs[col]
+    x = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    for back in range(6):
+        row = 5 - back
+        acc = rhs[row]
+        for j in range(row + 1, 6):
+            acc = acc - a[row, j] * x[j]
+        x[row] = acc / a[row, row]
+    group_delta[g] = x
+
+
+@wp.kernel
+def rigid_mode_apply(
+    particle_flags: wp.array[wp.int32],
+    inv_mass: wp.array[float],
+    particle_group: wp.array[wp.int32],
+    group_mass: wp.array[float],
+    group_moment: wp.array[wp.vec3],
+    group_delta: wp.array[wp.spatial_vector],
+    group_coupled: wp.array[wp.int32],
+    pos: wp.array[wp.vec3],
+    pos_copy: wp.array[wp.vec3],
+    displacements: wp.array[wp.vec3],
+):
+    """Move each particle of a corrected group by its group's rigid motion (in ``pos`` and ``pos_copy``); a group
+    coupled to another free group by self-contact is left as solved."""
+    i = wp.tid()
+    if not particle_flags[i] & ParticleFlags.ACTIVE or inv_mass[i] == 0.0:
+        return
+    g = particle_group[i]
+    total = group_mass[g]
+    if total <= 0.0:
+        return
+    d = group_delta[g]
+    if group_coupled:
+        if group_coupled[g] != 0:
+            return
+    r = pos[i] - group_moment[g] / total
+    move = wp.vec3(d[0], d[1], d[2]) + wp.cross(wp.vec3(d[3], d[4], d[5]), r)
+    moved = pos[i] + move
+    pos[i] = moved
+    if displacements:  # with self-contact, the move is truncated with the rest of the step's displacement
+        displacements[i] = displacements[i] + move
+    if pos_copy:
+        pos_copy[i] = moved
+
+
+@wp.kernel
 def compute_speculative_particle_caps(
     vel: wp.array[wp.vec3],
     gravity: wp.array[wp.vec3],
@@ -1481,21 +1667,28 @@ def mark_held_particle_groups(
 def mark_held_self_contact_groups(
     collision_info_array: wp.array[TriMeshCollisionInfo],
     tri_indices: wp.array2d[wp.int32],
+    pos: wp.array[wp.vec3],
+    contact_radius: float,
     particle_group: wp.array[wp.int32],
     group_held: wp.array[wp.int32],
 ):
-    """Flag both sides of every vertex-triangle contact between two different groups. A body touching its own
-    surface (near-contacts within one body's surface are common on coarse meshes) is not held by it."""
+    """Flag both sides of every vertex-triangle contact between two different groups closer than ``contact_radius``.
+    A body touching its own surface (near-contacts within one body's surface are common on coarse meshes) is not held
+    by it, and a pair found ahead (speculative detection reaches further than contact) holds nothing yet."""
     vertex = wp.tid()
     collision_info = collision_info_array[0]
     count = get_vertex_colliding_triangles_count(collision_info, vertex)
     group = particle_group[vertex]
     for i in range(count):
         triangle = get_vertex_colliding_triangles(collision_info, vertex, i)
-        other = particle_group[tri_indices[triangle, 0]]
+        t0 = tri_indices[triangle, 0]
+        other = particle_group[t0]
         if other != group:
-            group_held[group] = 1
-            group_held[other] = 1
+            closest, _bary, _feature = triangle_closest_point(pos[t0], pos[tri_indices[triangle, 1]],
+                                                             pos[tri_indices[triangle, 2]], pos[vertex])
+            if wp.length(closest - pos[vertex]) < contact_radius:
+                group_held[group] = 1
+                group_held[other] = 1
 
 
 @wp.kernel
