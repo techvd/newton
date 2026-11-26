@@ -62,6 +62,8 @@ from .particle_vbd_kernels import (
     update_velocity,
 )
 from .rigid_vbd_kernels import (
+    friction_anchor_begin,
+    friction_anchor_update,
     _NUM_CONTACT_THREADS_PER_BODY,
     RigidContactHistory,
     RigidForceElementAdjacencyInfo,
@@ -346,6 +348,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         particle_initial_guess: Literal["inertia", "adaptive"] = "inertia",
         particle_self_contact_speculative: bool = False,
         particle_rigid_mode_correction: bool = False,
+        particle_static_friction: bool = False,
         # Rigid body - constraint formulation and stabilization
         rigid_compliant_alm: bool | None = None,  # None retains legacy and emits the scoped migration warning
         rigid_avbd_alpha: float | None = None,  # Shared alpha override; None uses mode defaults
@@ -464,6 +467,18 @@ class SolverVBD(SolverBase, CouplingInterface):
                 as the coarse space). Bodies with a fixed particle, and free bodies in self-contact with another free
                 body (solving them one at a time against each other does not settle), are left as solved. Costs one
                 contact evaluation pass and a few small kernels per step.
+            particle_static_friction: Static friction for particle-shape contacts (colliders and the ground). The
+                regularized Coulomb friction (``friction_epsilon``) measures slip from the step's start, so a contact
+                under a steady tangential load creeps by one regularized slip every step instead of sticking: a soft
+                body pressed by a still collider slowly flows, and where a node creeps against a collider edge it
+                eventually snaps past it, releasing stored elastic energy at once. With this on, each particle in
+                contact keeps a stick anchor in the touching shape's body frame; friction slip is measured from the
+                anchor, which stays put while the slip is within ``friction_epsilon * dt`` (stick) and is dragged to
+                that distance behind the particle beyond it (slide, kinetic friction along the slip). Same force law
+                and stiffness; the anchor is updated once per step, after the iterations. A new contact starts with
+                the step slip; leaving contact or touching another shape drops the anchor. One anchor per particle
+                (a particle touching two shapes keeps whichever updates last). Self-contact and edge/face (full
+                surface) contacts keep the step slip.
 
             Rigid body parameters:
 
@@ -852,6 +867,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             particle_initial_guess,
             particle_self_contact_speculative,
             particle_rigid_mode_correction,
+            particle_static_friction,
         )
 
         # Initialize rigid body system and rigid-particle (body-particle) interaction state
@@ -901,8 +917,14 @@ class SolverVBD(SolverBase, CouplingInterface):
         particle_initial_guess: str = "inertia",
         particle_self_contact_speculative: bool = False,
         particle_rigid_mode_correction: bool = False,
+        particle_static_friction: bool = False,
     ):
         """Initialize particle-specific data structures and settings."""
+        self.particle_static_friction = bool(particle_static_friction) and model.particle_count > 0
+        count = model.particle_count if self.particle_static_friction else 0
+        self.friction_anchor = wp.zeros(count, dtype=wp.vec3, device=self.device)
+        self.friction_anchor_shape = wp.full(count, -1, dtype=wp.int32, device=self.device)
+        self.friction_anchor_shape_prev = wp.full(count, -1, dtype=wp.int32, device=self.device)
         if particle_initial_guess not in ("inertia", "adaptive"):
             raise ValueError(
                 f"particle_initial_guess must be 'inertia' or 'adaptive', got {particle_initial_guess!r}"
@@ -2431,6 +2453,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._finalize_rigid_bodies(state_in, state_out, dt)
         if self.particle_rigid_mode_correction and self.model.particle_count:
             self._rigid_mode_correction(state_in, state_out, contacts, dt)
+        if self.particle_static_friction and contacts is not None:
+            self._update_friction_anchors(state_in, state_out, contacts, dt)
         self._finalize_particles(state_out, dt)
 
     @override
@@ -3341,6 +3365,26 @@ class SolverVBD(SolverBase, CouplingInterface):
         if state_out.particle_q.ptr != state_in.particle_q.ptr:
             wp.copy(state_out.particle_q, state_in.particle_q)
 
+    def _update_friction_anchors(self, state_in: State, state_out: State, contacts: Contacts, dt: float):
+        """Keep, drag or start each touching particle's stick anchor (``particle_static_friction``)."""
+        body_q, _body_q_prev, _body_qd = self._particle_contact_poses(state_in, state_out)
+        wp.launch(
+            kernel=friction_anchor_begin,
+            dim=self.model.particle_count,
+            inputs=[self.friction_anchor_shape, self.friction_anchor_shape_prev],
+            device=self.device,
+        )
+        wp.launch(
+            kernel=friction_anchor_update,
+            dim=contacts.soft_contact_max,
+            inputs=[dt, self.friction_epsilon, state_out.particle_q, self.model.particle_radius,
+                    contacts.soft_contact_indices, contacts.soft_contact_count, contacts.soft_contact_max,
+                    self.model.shape_body, body_q, contacts.soft_contact_shape, contacts.soft_contact_body_pos,
+                    contacts.soft_contact_normal, self.model.shape_margin, self.friction_anchor_shape_prev],
+            outputs=[self.friction_anchor, self.friction_anchor_shape],
+            device=self.device,
+        )
+
     def _particle_contact_poses(self, state_in: State, state_out: State):
         """Rigid-body poses (current, previous, velocity) the particle-rigid contacts are evaluated against."""
         if self.integrate_with_external_rigid_solver:
@@ -3383,6 +3427,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                     contacts.soft_contact_normal,
                     self.model.shape_margin,
                     contacts.soft_contact_barycentric,
+                    self.friction_anchor,
+                    self.friction_anchor_shape,
                 ],
                 outputs=[
                     self.particle_forces,

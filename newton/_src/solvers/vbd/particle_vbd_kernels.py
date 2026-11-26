@@ -17,6 +17,7 @@ import warp as wp
 from newton._src.math import orthonormal_basis
 from newton._src.solvers.vbd.rigid_vbd_kernels import (
     _eval_body_particle_contact,
+    _eval_body_particle_contact_anchored,
     _eval_soft_ef_contact,
     _reset_world_selected,
     evaluate_body_particle_contact,
@@ -2657,6 +2658,9 @@ def accumulate_particle_body_contact_force_and_hessian(
     shape_margin: wp.array[float],
     # Barycentric weights on each record's soft particles; (1, 0, 0) for a particle contact.
     contact_barycentric: wp.array[wp.vec3],
+    # Static friction stick anchors per particle (empty: off).
+    friction_anchor: wp.array[wp.vec3],
+    friction_anchor_shape: wp.array[wp.int32],
     # outputs: particle force and hessian
     particle_forces: wp.array[wp.vec3],
     particle_hessians: wp.array[wp.mat33],
@@ -2682,7 +2686,7 @@ def accumulate_particle_body_contact_force_and_hessian(
         # Particle contact (p, -1, -1): single-vertex path, unchanged from the pre-unification code.
         particle_idx = corners[0]
         if particle_colors[particle_idx] == current_color:
-            body_contact_force, body_contact_hessian = _eval_body_particle_contact(
+            body_contact_force, body_contact_hessian = _eval_body_particle_contact_anchored(
                 particle_idx,
                 pos[particle_idx],
                 pos_anchor[particle_idx],
@@ -2703,6 +2707,8 @@ def accumulate_particle_body_contact_force_and_hessian(
                 contact_normal,
                 shape_margin,
                 dt,
+                friction_anchor,
+                friction_anchor_shape,
             )
             wp.atomic_add(particle_forces, particle_idx, body_contact_force)
             wp.atomic_add(particle_hessians, particle_idx, body_contact_hessian)
