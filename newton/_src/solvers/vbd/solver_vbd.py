@@ -64,6 +64,11 @@ from .particle_vbd_kernels import (
     apply_truncation_ts,
     build_particle_body_contact_adjacency_active,
     compute_speculative_particle_caps,
+    rigid_mode_accumulate_mass,
+    rigid_mode_accumulate_system,
+    rigid_mode_apply,
+    rigid_mode_mark_coupled,
+    rigid_mode_solve,
     # Solver kernels (particle VBD)
     forward_step,
     mark_held_contact_groups,
@@ -501,6 +506,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         particle_external_edge_contact_filtering_map: dict | None = None,
         particle_initial_guess: Literal["inertia", "adaptive"] = "inertia",
         particle_self_contact_speculative: bool = False,
+        particle_rigid_mode_correction: bool = False,
         # Rigid body - constraint formulation and stabilization
         rigid_compliant_alm: bool = _DEPRECATED_RIGID_COMPLIANT_ALM_UNSET,
         rigid_avbd_alpha: float | None = None,  # Shared alpha override; None uses zero
@@ -629,6 +635,16 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 detect. Contacts within one body keep the fixed query radius, so a body folding onto itself faster
                 than the fixed limit is not guaranteed penetration-free. Requires VBD's own self-contact detector
                 (no ``collision_pipeline``).
+            particle_rigid_mode_correction: After the iterations, move each connected body rigidly by one Newton
+                step on its six rigid degrees of freedom (translation and rotation about its centre of mass), against
+                its inertia and its contact forces re-evaluated at the final positions. Elastic energy does not change
+                under rigid motion, and a Gauss-Seidel solve converges slowest on exactly these modes: with a fixed
+                iteration count, an asymmetric mesh (a tetrahedralized sphere) leaves a net residual force and torque,
+                so a body landing straight down gains sideways momentum or spin it should not have. The correction
+                restores the implicit step's momentum balance for those modes (a two-level solve with the rigid modes
+                as the coarse space). Bodies with a fixed particle, and free bodies in self-contact with another free
+                body (solving them one at a time against each other does not settle), are left as solved. Costs one
+                contact evaluation pass and a few small kernels per step.
 
             rigid_compliant_alm: Deprecated; omit it. Compliant ALM is always used for
                 body-body contacts, structural joints, drives, and limits. Explicit
@@ -1099,6 +1115,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             enable_fast_math,
             particle_initial_guess,
             particle_self_contact_speculative,
+            particle_rigid_mode_correction,
         )
 
         # Routed tendon geometry and material state are shared with XPBD; VBD
@@ -1200,6 +1217,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         enable_fast_math: bool,
         particle_initial_guess: str = "inertia",
         particle_self_contact_speculative: bool = False,
+        particle_rigid_mode_correction: bool = False,
     ):
         """Initialize particle-specific data structures and settings."""
         if particle_initial_guess not in ("inertia", "adaptive"):
@@ -1209,6 +1227,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self.particle_initial_guess = particle_initial_guess
         # Velocities at the start of the previous step, for the adaptive initial guess.
         self.particle_qd_prev_step = None
+        self.particle_rigid_mode_correction = bool(particle_rigid_mode_correction) and model.particle_count > 0
+        if self.particle_rigid_mode_correction and self.rigid_soft_enable_dat:
+            raise ValueError("particle_rigid_mode_correction does not support rigid_soft_enable_dat: the correction's move "
+                             "is truncated against self-contact only")
         # Adaptive guess: one group per connected body, flagged each step when something holds it.
         self.particle_group = None
         self.particle_group_held = None
@@ -1221,7 +1243,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             return
         if self.particle_self_contact_speculative and self.collision_pipeline is not None:
             raise ValueError("particle_self_contact_speculative needs VBD's own self-contact detector (no collision_pipeline)")
-        if particle_initial_guess == "adaptive" or self.particle_self_contact_speculative:
+        if particle_initial_guess == "adaptive" or self.particle_self_contact_speculative or self.particle_rigid_mode_correction:
             groups = _particle_groups(model)
             self.particle_group = wp.array(groups, dtype=wp.int32, device=self.device)
         if particle_initial_guess == "adaptive":
@@ -1229,6 +1251,15 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             self.particle_group_held = wp.zeros(int(groups.max()) + 1, dtype=wp.int32, device=self.device)
         if self.particle_self_contact_speculative:
             self.particle_speculative_caps = wp.zeros(model.particle_count, dtype=float, device=self.device)
+        if self.particle_rigid_mode_correction:
+            count = int(groups.max()) + 1
+            self._rigid_group_mass = wp.zeros(count, dtype=float, device=self.device)
+            self._rigid_group_moment = wp.zeros(count, dtype=wp.vec3, device=self.device)
+            self._rigid_group_fixed = wp.zeros(count, dtype=wp.int32, device=self.device)
+            self._rigid_group_hessian = wp.zeros(count, dtype=wp.spatial_matrix, device=self.device)
+            self._rigid_group_gradient = wp.zeros(count, dtype=wp.spatial_vector, device=self.device)
+            self._rigid_group_delta = wp.zeros(count, dtype=wp.spatial_vector, device=self.device)
+            self._rigid_group_coupled = wp.zeros(count, dtype=wp.int32, device=self.device)
         self._particle_step_dt = 0.0
 
         self.particle_collision_detection_interval = particle_collision_detection_interval
@@ -2935,6 +2966,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             self._update_tendon_segment_diagnostics(state_out, dt)
         if self.iterations == 0 and self.model.particle_count > 0:
             wp.copy(state_out.particle_q, state_in.particle_q)
+        if self.particle_rigid_mode_correction and self.model.particle_count:
+            self._rigid_mode_correction(state_in, state_out, contacts, dt)
         self._finalize_particles(state_out, dt)
         self._save_tendon_history(state_out)
 
@@ -4245,6 +4278,226 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
 
         self._refresh_body_particle_contact_state(contacts, refresh)
 
+    def _rigid_mode_correction(self, state_in: State, state_out: State, contacts: Contacts | None, dt: float):
+        """One Newton step on each free group's rigid motion (see ``particle_rigid_mode_correction``)."""
+        model = self.model
+        self.particle_forces.zero_()
+        self.particle_hessians.zero_()
+        poses = self._particle_contact_poses(state_in, state_out)
+        contact_filter = (
+            _make_soft_contact_filter_data(model, contacts, state_in.particle_q, poses[0]) if contacts is not None else None
+        )
+        for color in range(len(model.particle_color_groups)):
+            self._accumulate_particle_contacts(state_in, contacts, dt, color, poses, contact_filter)
+        for array in (self._rigid_group_mass, self._rigid_group_moment, self._rigid_group_fixed,
+                      self._rigid_group_hessian, self._rigid_group_gradient, self._rigid_group_coupled):
+            array.zero_()
+        wp.launch(
+            kernel=rigid_mode_accumulate_mass,
+            dim=model.particle_count,
+            inputs=[state_in.particle_q, model.particle_mass, model.particle_inv_mass, model.particle_flags,
+                    self.particle_group, self._rigid_group_mass, self._rigid_group_moment, self._rigid_group_fixed],
+            device=self.device,
+        )
+        if self.particle_enable_self_contact and model.tri_count:
+            wp.launch(
+                kernel=rigid_mode_mark_coupled,
+                dim=model.particle_count,
+                inputs=[self.trimesh_collision_info, model.tri_indices, self.particle_group, self._rigid_group_fixed,
+                        self._rigid_group_coupled],
+                device=self.device,
+            )
+        wp.launch(
+            kernel=rigid_mode_accumulate_system,
+            dim=model.particle_count,
+            inputs=[dt, state_in.particle_q, self.inertia, model.particle_mass, model.particle_inv_mass,
+                    model.particle_flags, self.particle_group, self.particle_forces, self.particle_hessians,
+                    self._rigid_group_mass, self._rigid_group_moment, self._rigid_group_hessian,
+                    self._rigid_group_gradient],
+            device=self.device,
+        )
+        wp.launch(
+            kernel=rigid_mode_solve,
+            dim=self._rigid_group_mass.shape[0],
+            inputs=[self._rigid_group_hessian, self._rigid_group_gradient, self._rigid_group_mass,
+                    self._rigid_group_fixed, self._rigid_group_delta],
+            device=self.device,
+        )
+        wp.launch(
+            kernel=rigid_mode_apply,
+            dim=model.particle_count,
+            inputs=[model.particle_flags, model.particle_inv_mass, self.particle_group, self._rigid_group_mass,
+                    self._rigid_group_moment, self._rigid_group_delta, self._rigid_group_coupled, state_in.particle_q,
+                    None, self.particle_displacements if self.particle_enable_self_contact else None],
+            device=self.device,
+        )
+        if self.particle_enable_self_contact:
+            # Keep the solve penetration-free: the move goes through the same self-contact truncation as the
+            # iterations' moves (no rigid-soft DAT pass: the option refuses rigid_soft_enable_dat).
+            self._penetration_free_truncation(state_in, None)
+        if state_out.particle_q.ptr != state_in.particle_q.ptr:
+            wp.copy(state_out.particle_q, state_in.particle_q)
+
+    def _particle_contact_poses(self, state_in: State, state_out: State):
+        """Rigid-body poses (current, previous, velocity) the particle-rigid contacts are evaluated against."""
+        if self.integrate_with_external_rigid_solver:
+            return state_out.body_q, state_in.body_q, state_out.body_qd
+        body_q_prev = self.body_q_prev if self.model.body_count > 0 else None
+        return state_in.body_q, body_q_prev, state_in.body_qd
+
+    def _accumulate_particle_contacts(
+        self, state_in: State, contacts: Contacts | None, dt: float, color: int, poses, contact_filter
+    ):
+        """Add one color's particle-body attachment, body-particle contact, spring and self-contact forces and
+        Hessians at ``state_in``'s positions to ``particle_forces`` / ``particle_hessians``."""
+        model = self.model
+        body_q_for_particles, body_q_prev_for_particles, body_qd_for_particles = poses
+        if model.attachment_particle_body_count > 0:
+            wp.launch(
+                kernel=accumulate_body_particle_attachment_force_and_hessian,
+                dim=model.attachment_particle_body_count,
+                inputs=[
+                    dt,
+                    color,
+                    self.particle_q_prev,
+                    state_in.particle_q,
+                    model.particle_colors,
+                    body_q_for_particles,
+                    body_q_prev_for_particles,
+                    model.attachment_particle_body_body,
+                    model.attachment_particle_body_particle,
+                    model.attachment_particle_body_body_point,
+                    model.attachment_particle_body_stiffness,
+                    model.attachment_particle_body_damping,
+                    model.attachment_particle_body_enabled,
+                    self._attachment_particle_body_rho,
+                    self._attachment_particle_body_lambda,
+                ],
+                outputs=[self.particle_forces, self.particle_hessians],
+                device=self.device,
+            )
+
+        if contacts is not None and contacts.soft_contact_max > 0:
+            contact_material_and_body_inputs = [
+                self.body_particle_contact_material_ke,
+                self.body_particle_contact_material_kd,
+                self.body_particle_contact_material_mu,
+                model.shape_body,
+                body_q_for_particles,
+                body_q_prev_for_particles,
+                body_qd_for_particles,
+                model.body_com,
+                contacts.soft_contact_shape,
+                contacts.soft_contact_body_pos,
+                contacts.soft_contact_body_vel,
+                contacts.soft_contact_normal,
+                model.shape_margin,
+                contacts.soft_contact_barycentric,
+            ]
+            if self._particle_contact_use_gather:
+                # Deterministic modes: one thread per colored particle, no output atomics.
+                wp.launch(
+                    kernel=gather_particle_body_contact_force_and_hessian,
+                    dim=self.model.particle_color_groups[color].size,
+                    block_dim=_PARTICLE_CONTACT_GATHER_BLOCK_DIM,
+                    inputs=[
+                        dt,
+                        self.model.particle_color_groups[color],
+                        self.particle_q_prev,
+                        state_in.particle_q,
+                        self.friction_epsilon,
+                        self.rigid_soft_contact_use_log_barrier,
+                        self.soft_contact_damping_bidirectional,
+                        model.particle_radius,
+                        contacts.soft_contact_indices,
+                        self._particle_contact_head,
+                        self._particle_contact_next,
+                        *contact_material_and_body_inputs,
+                        contact_filter,
+                    ],
+                    outputs=[
+                        self.particle_forces,
+                        self.particle_hessians,
+                    ],
+                    device=self.device,
+                )
+            else:
+                # Default: one record per thread over the active prefix, atomics into the
+                # active color's corners. The worker grid is host-static (graph-safe).
+                wp.launch(
+                    kernel=scatter_particle_body_contact_force_and_hessian,
+                    dim=self._particle_contact_worker_count,
+                    inputs=[
+                        dt,
+                        color,
+                        self.particle_q_prev,
+                        state_in.particle_q,
+                        self.model.particle_colors,
+                        self.friction_epsilon,
+                        self.rigid_soft_contact_use_log_barrier,
+                        self.soft_contact_damping_bidirectional,
+                        model.particle_radius,
+                        contacts.soft_contact_indices,
+                        contacts.soft_contact_count,
+                        contact_filter,
+                        contacts.soft_contact_max,
+                        self._particle_contact_worker_count,
+                        *contact_material_and_body_inputs,
+                    ],
+                    outputs=[
+                        self.particle_forces,
+                        self.particle_hessians,
+                    ],
+                    device=self.device,
+                )
+
+        if model.spring_count:
+            wp.launch(
+                kernel=accumulate_spring_force_and_hessian,
+                inputs=[
+                    dt,
+                    color,
+                    self.particle_q_prev,
+                    state_in.particle_q,
+                    self.model.particle_colors,
+                    model.spring_count,
+                    self.model.spring_indices,
+                    self.model.spring_rest_length,
+                    self.model.spring_stiffness,
+                    self.model.spring_damping,
+                ],
+                outputs=[self.particle_forces, self.particle_hessians],
+                dim=model.spring_count,
+                device=self.device,
+            )
+
+        if self.particle_enable_self_contact:
+            wp.launch(
+                kernel=accumulate_self_contact_force_and_hessian,
+                dim=self.particle_self_contact_evaluation_kernel_launch_size,
+                inputs=[
+                    dt,
+                    color,
+                    self.particle_q_prev,
+                    state_in.particle_q,
+                    self.model.particle_colors,
+                    self.model.tri_indices,
+                    self.model.edge_indices,
+                    # self-contact
+                    self.trimesh_collision_info,
+                    self.particle_self_contact_margin,
+                    self.model.soft_contact_ke,
+                    self.model.soft_contact_kd,
+                    self.model.soft_contact_mu,
+                    self.friction_epsilon,
+                    self.soft_contact_damping_bidirectional,
+                    self._self_contact_edge_edge_parallel_epsilon,
+                ],
+                outputs=[self.particle_forces, self.particle_hessians],
+                device=self.device,
+                max_blocks=self.model.device.sm_count,
+            )
+
     def _solve_particle_iteration(
         self,
         state_in: State,
@@ -4257,24 +4510,14 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         model = self.model
 
         # Select rigid-body poses for particle-rigid contact evaluation
-        if self.integrate_with_external_rigid_solver:
-            body_q_for_particles = state_out.body_q
-            body_q_prev_for_particles = state_in.body_q
-            body_qd_for_particles = state_out.body_qd
-        else:
-            body_q_for_particles = state_in.body_q
-            if model.body_count > 0:
-                body_q_prev_for_particles = self.body_q_prev
-            else:
-                body_q_prev_for_particles = None
-            body_qd_for_particles = state_in.body_qd
+        poses = self._particle_contact_poses(state_in, state_out)
 
         # Early exit if no particles
         if model.particle_count == 0:
             return
 
         contact_filter = (
-            _make_soft_contact_filter_data(model, contacts, state_in.particle_q, body_q_for_particles)
+            _make_soft_contact_filter_data(model, contacts, state_in.particle_q, poses[0])
             if contacts is not None
             else None
         )
@@ -4285,151 +4528,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
 
         # Iterate over color groups
         for color in range(len(self.model.particle_color_groups)):
-            if model.attachment_particle_body_count > 0:
-                wp.launch(
-                    kernel=accumulate_body_particle_attachment_force_and_hessian,
-                    dim=model.attachment_particle_body_count,
-                    inputs=[
-                        dt,
-                        color,
-                        self.particle_q_prev,
-                        state_in.particle_q,
-                        model.particle_colors,
-                        body_q_for_particles,
-                        body_q_prev_for_particles,
-                        model.attachment_particle_body_body,
-                        model.attachment_particle_body_particle,
-                        model.attachment_particle_body_body_point,
-                        model.attachment_particle_body_stiffness,
-                        model.attachment_particle_body_damping,
-                        model.attachment_particle_body_enabled,
-                        self._attachment_particle_body_rho,
-                        self._attachment_particle_body_lambda,
-                    ],
-                    outputs=[self.particle_forces, self.particle_hessians],
-                    device=self.device,
-                )
-
-            if contacts is not None and contacts.soft_contact_max > 0:
-                contact_material_and_body_inputs = [
-                    self.body_particle_contact_material_ke,
-                    self.body_particle_contact_material_kd,
-                    self.body_particle_contact_material_mu,
-                    model.shape_body,
-                    body_q_for_particles,
-                    body_q_prev_for_particles,
-                    body_qd_for_particles,
-                    model.body_com,
-                    contacts.soft_contact_shape,
-                    contacts.soft_contact_body_pos,
-                    contacts.soft_contact_body_vel,
-                    contacts.soft_contact_normal,
-                    model.shape_margin,
-                    contacts.soft_contact_barycentric,
-                ]
-                if self._particle_contact_use_gather:
-                    # Deterministic modes: one thread per colored particle, no output atomics.
-                    wp.launch(
-                        kernel=gather_particle_body_contact_force_and_hessian,
-                        dim=self.model.particle_color_groups[color].size,
-                        block_dim=_PARTICLE_CONTACT_GATHER_BLOCK_DIM,
-                        inputs=[
-                            dt,
-                            self.model.particle_color_groups[color],
-                            self.particle_q_prev,
-                            state_in.particle_q,
-                            self.friction_epsilon,
-                            self.rigid_soft_contact_use_log_barrier,
-                            self.soft_contact_damping_bidirectional,
-                            model.particle_radius,
-                            contacts.soft_contact_indices,
-                            self._particle_contact_head,
-                            self._particle_contact_next,
-                            *contact_material_and_body_inputs,
-                            contact_filter,
-                        ],
-                        outputs=[
-                            self.particle_forces,
-                            self.particle_hessians,
-                        ],
-                        device=self.device,
-                    )
-                else:
-                    # Default: one record per thread over the active prefix, atomics into the
-                    # active color's corners. The worker grid is host-static (graph-safe).
-                    wp.launch(
-                        kernel=scatter_particle_body_contact_force_and_hessian,
-                        dim=self._particle_contact_worker_count,
-                        inputs=[
-                            dt,
-                            color,
-                            self.particle_q_prev,
-                            state_in.particle_q,
-                            self.model.particle_colors,
-                            self.friction_epsilon,
-                            self.rigid_soft_contact_use_log_barrier,
-                            self.soft_contact_damping_bidirectional,
-                            model.particle_radius,
-                            contacts.soft_contact_indices,
-                            contacts.soft_contact_count,
-                            contact_filter,
-                            contacts.soft_contact_max,
-                            self._particle_contact_worker_count,
-                            *contact_material_and_body_inputs,
-                        ],
-                        outputs=[
-                            self.particle_forces,
-                            self.particle_hessians,
-                        ],
-                        device=self.device,
-                    )
-
-            if model.spring_count:
-                wp.launch(
-                    kernel=accumulate_spring_force_and_hessian,
-                    inputs=[
-                        dt,
-                        color,
-                        self.particle_q_prev,
-                        state_in.particle_q,
-                        self.model.particle_colors,
-                        model.spring_count,
-                        self.model.spring_indices,
-                        self.model.spring_rest_length,
-                        self.model.spring_stiffness,
-                        self.model.spring_damping,
-                    ],
-                    outputs=[self.particle_forces, self.particle_hessians],
-                    dim=model.spring_count,
-                    device=self.device,
-                )
-
-            if self.particle_enable_self_contact:
-                wp.launch(
-                    kernel=accumulate_self_contact_force_and_hessian,
-                    dim=self.particle_self_contact_evaluation_kernel_launch_size,
-                    inputs=[
-                        dt,
-                        color,
-                        self.particle_q_prev,
-                        state_in.particle_q,
-                        self.model.particle_colors,
-                        self.model.tri_indices,
-                        self.model.edge_indices,
-                        # self-contact
-                        self.trimesh_collision_info,
-                        self.particle_self_contact_margin,
-                        self.model.soft_contact_ke,
-                        self.model.soft_contact_kd,
-                        self.model.soft_contact_mu,
-                        self.friction_epsilon,
-                        self.soft_contact_damping_bidirectional,
-                        self._self_contact_edge_edge_parallel_epsilon,
-                    ],
-                    outputs=[self.particle_forces, self.particle_hessians],
-                    device=self.device,
-                    max_blocks=self.model.device.sm_count,
-                )
+            self._accumulate_particle_contacts(state_in, contacts, dt, color, poses, contact_filter)
             if self.use_particle_tile_solve:
                 particle_count_in_color = self.model.particle_color_groups[color].size
                 per_block = self._tiled_elasticity_particles_per_block
