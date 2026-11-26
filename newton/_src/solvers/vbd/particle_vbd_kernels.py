@@ -27,6 +27,7 @@ from ...geometry.kernels import triangle_closest_point
 from ...geometry.tri_mesh_collision import (
     TriMeshCollisionInfo,
     get_edge_colliding_edges_count,
+    get_vertex_colliding_triangles,
     get_vertex_colliding_triangles_count,
 )
 from ...utils.mesh import (
@@ -1391,6 +1392,8 @@ def forward_step(
     external_force: wp.array[wp.vec3],
     particle_flags: wp.array[wp.int32],
     vel_prev_step: wp.array[wp.vec3],
+    particle_group: wp.array[wp.int32],
+    group_held: wp.array[wp.int32],
     inertia_out: wp.array[wp.vec3],
     displacements_out: wp.array[wp.vec3],
 ):
@@ -1404,6 +1407,12 @@ def forward_step(
     particle actually had over the previous step. A particle held by contact or elasticity
     (``s`` near 0) starts at ``pos + vel dt``; a free particle (``s`` near 1) starts at the
     inertial target.
+
+    With ``group_held`` (one flag per connected group of particles, ``particle_group`` mapping each
+    particle to its group), a particle whose group nothing holds this step (no contact, no fixed
+    particle) starts at the inertial target: in free flight the inertial target is exact, while
+    ``a_obs`` of a stiff, truncated solve falls short of ``a`` and would feed that shortfall back
+    into the next step.
     """
     particle = wp.tid()
 
@@ -1425,7 +1434,10 @@ def forward_step(
         if vel_prev_step:
             scale = float(1.0)
             acceleration_sq = wp.dot(acceleration, acceleration)
-            if acceleration_sq > 0.0:
+            free = False
+            if group_held:
+                free = group_held[particle_group[particle]] == 0
+            if acceleration_sq > 0.0 and not free:
                 observed = (vel[particle] - vel_prev_step[particle]) / dt
                 scale = wp.clamp(wp.dot(observed, acceleration) / acceleration_sq, 0.0, 1.0)
             displacements_out[particle] = (vel[particle] + acceleration * (scale * dt)) * dt
@@ -1433,6 +1445,49 @@ def forward_step(
             displacements_out[particle] = vel_new * dt
     if vel_prev_step:
         vel_prev_step[particle] = vel[particle]
+
+
+@wp.kernel
+def mark_held_particle_groups(
+    inv_mass: wp.array[float],
+    particle_group: wp.array[wp.int32],
+    group_held: wp.array[wp.int32],
+):
+    """Flag the group of every fixed particle."""
+    particle = wp.tid()
+    if inv_mass[particle] == 0.0:
+        group_held[particle_group[particle]] = 1
+
+
+@wp.kernel
+def mark_held_self_contact_groups(
+    collision_info_array: wp.array[TriMeshCollisionInfo],
+    tri_indices: wp.array2d[wp.int32],
+    particle_group: wp.array[wp.int32],
+    group_held: wp.array[wp.int32],
+):
+    """Flag both sides of every vertex-triangle self-contact: the vertex's group and the triangle's."""
+    vertex = wp.tid()
+    collision_info = collision_info_array[0]
+    count = get_vertex_colliding_triangles_count(collision_info, vertex)
+    if count > 0:
+        group_held[particle_group[vertex]] = 1
+    for i in range(count):
+        triangle = get_vertex_colliding_triangles(collision_info, vertex, i)
+        group_held[particle_group[tri_indices[triangle, 0]]] = 1
+
+
+@wp.kernel
+def mark_held_contact_groups(
+    soft_contact_count: wp.array[wp.int32],
+    soft_contact_particle: wp.array[wp.int32],
+    particle_group: wp.array[wp.int32],
+    group_held: wp.array[wp.int32],
+):
+    """Flag the group of every particle in a body-particle contact."""
+    contact = wp.tid()
+    if contact < soft_contact_count[0]:
+        group_held[particle_group[soft_contact_particle[contact]]] = 1
 
 
 @wp.kernel

@@ -4608,6 +4608,33 @@ def _particle_initial_guess(test, device):
     expected = 0.5 * 9.81 * (120 * dt) ** 2
     test.assertAlmostEqual(fallen, expected, delta=0.02 * expected)
 
+    # A stiff free body (rubber-like, 1.2 MPa, Poisson 0.49: P-wave CFL about 12 at this step) also falls as with
+    # the inertial guess. Its truncated solve recovers a whole-body translation slowly, so an acceleration measured
+    # from the previous step would fall short of gravity and feed the shortfall back; nothing holds the body, so
+    # its particles start at the inertial target.
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, -9.81, 0.0))
+    builder.add_soft_grid(
+        pos=wp.vec3(0.0, 0.0, 0.0),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0, 0.0, 0.0),
+        dim_x=4,
+        dim_y=4,
+        dim_z=4,
+        cell_x=0.02,
+        cell_y=0.02,
+        cell_z=0.02,
+        density=930.0,
+        k_mu=4.0e5,
+        k_lambda=2.0e7,
+        k_damp=50.0,
+    )
+    builder.color()
+    stiff = builder.finalize(device=device)
+    start = stiff.particle_q.numpy()[:, 1].mean()
+    solver = newton.solvers.SolverVBD(stiff, iterations=10, particle_initial_guess="adaptive")
+    fallen = start - _run_particles(stiff, solver, steps=120, dt=dt)[:, 1].mean()
+    test.assertAlmostEqual(fallen, expected, delta=0.02 * expected)  # without the free-body rule: 10% short
+
 
 add_function_test(TestSolverVBD, "test_particle_initial_guess", _particle_initial_guess, devices=devices)
 

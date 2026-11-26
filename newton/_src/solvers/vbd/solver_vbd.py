@@ -47,6 +47,9 @@ from .particle_vbd_kernels import (
     apply_truncation_ts,
     # Solver kernels (particle VBD)
     forward_step,
+    mark_held_contact_groups,
+    mark_held_particle_groups,
+    mark_held_self_contact_groups,
     reset_particle_state,
     solve_elasticity,
     solve_elasticity_tile,
@@ -117,6 +120,34 @@ def _rigid_lambda_retention(alpha: float, gamma: float, use_compliant_alm: bool)
     residual. The legacy path keeps its historical ``alpha * gamma`` policy.
     """
     return gamma if use_compliant_alm else alpha * gamma
+
+
+def _particle_groups(model: Model) -> np.ndarray:
+    """Connected-component label (0..groups-1) of every particle, joined by tets, triangles, edges and springs."""
+    count = model.particle_count
+    elements = []
+    for name in ("tet_indices", "tri_indices", "edge_indices", "spring_indices"):
+        array = getattr(model, name, None)
+        if array is None or array.shape[0] == 0:
+            continue
+        indices = array.numpy().reshape(array.shape[0], -1) if name != "spring_indices" else array.numpy().reshape(-1, 2)
+        elements.append(indices)
+    labels = np.arange(count, dtype=np.int64)
+    while elements:  # propagate the smallest label along every element until nothing changes
+        changed = False
+        for indices in elements:
+            safe = np.where(indices >= 0, indices, 0)
+            element_min = np.where(indices >= 0, labels[safe], count).min(axis=1)
+            before = labels.copy()
+            for column in range(indices.shape[1]):
+                valid = indices[:, column] >= 0
+                np.minimum.at(labels, indices[valid, column], element_min[valid])
+            changed = changed or not np.array_equal(before, labels)
+        labels = labels[labels]  # pointer jumping: follow each label to its own label
+        if not changed:
+            break
+    _unique, groups = np.unique(labels, return_inverse=True)
+    return groups.astype(np.int32)
 
 
 class SolverVBD(SolverBase, CouplingInterface):
@@ -394,7 +425,12 @@ class SolverVBD(SolverBase, CouplingInterface):
                 inertial start biases resting bodies: the truncated solve cannot get back to equilibrium
                 from a guess a full gravity step away, and damping (``k_damp``), which slows each
                 iteration, makes the stationary error larger. A soft column then rests visibly short of
-                its elastic height. ``"adaptive"`` removes that bias while free fall stays inertial.
+                its elastic height. ``"adaptive"`` removes that bias while free fall stays inertial: the
+                scaling applies only to particles of a connected body (joined by tets, triangles, edges or
+                springs) that something holds this step (a fixed particle, a body-particle contact or a
+                self-contact). A free body starts at the inertial target, which is exact in free flight; a
+                stiff body's truncated solve would otherwise fall short of gravity and the measured
+                acceleration would carry that shortfall into the next step.
 
             Rigid body parameters:
 
@@ -840,8 +876,14 @@ class SolverVBD(SolverBase, CouplingInterface):
         # Early exit if no particles
         if model.particle_count == 0:
             return
+        # Adaptive guess: one group per connected body, flagged each step when something holds it.
+        self.particle_group = None
+        self.particle_group_held = None
         if particle_initial_guess == "adaptive":
             self.particle_qd_prev_step = wp.clone(model.particle_qd, device=self.device)
+            groups = _particle_groups(model)
+            self.particle_group = wp.array(groups, dtype=wp.int32, device=self.device)
+            self.particle_group_held = wp.zeros(int(groups.max()) + 1, dtype=wp.int32, device=self.device)
 
         self.particle_collision_detection_interval = particle_collision_detection_interval
         self.particle_topological_contact_filter_threshold = particle_topological_contact_filter_threshold
@@ -2303,7 +2345,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             control = self.model.control(clone_variables=False)
 
         self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid)
-        self._initialize_particles(state_in, state_out, dt)
+        self._initialize_particles(state_in, state_out, dt, contacts)
 
         if self._rigid_mode_this_step == _Frequency.PRE_POST_INIT:
             iterate = self._rigid_iterate_view(state_in, state_out)
@@ -2620,7 +2662,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 device=self.device,
             )
 
-    def _initialize_particles(self, state_in: State, state_out: State, dt: float):
+    def _initialize_particles(self, state_in: State, state_out: State, dt: float, contacts: Contacts | None = None):
         """Initialize particle positions for the VBD iteration."""
         model = self.model
 
@@ -2635,6 +2677,9 @@ class SolverVBD(SolverBase, CouplingInterface):
             self.pos_prev_collision_detection.assign(state_in.particle_q)
             self.particle_displacements.zero_()
 
+        if self.particle_group_held is not None:
+            self._mark_held_particle_groups(contacts)
+
         wp.launch(
             kernel=forward_step,
             inputs=[
@@ -2648,6 +2693,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                 state_in.particle_f,
                 self.model.particle_flags,
                 self.particle_qd_prev_step,
+                self.particle_group,
+                self.particle_group_held,
             ],
             outputs=[
                 self.inertia,
@@ -2658,6 +2705,37 @@ class SolverVBD(SolverBase, CouplingInterface):
         )
 
         self._penetration_free_truncation(state_in.particle_q)
+
+    def _mark_held_particle_groups(self, contacts: Contacts | None) -> None:
+        """Flag each particle group held this step: a fixed particle, a self-contact, or a body-particle contact."""
+        model = self.model
+        held = self.particle_group_held
+        held.zero_()
+        wp.launch(
+            kernel=mark_held_particle_groups,
+            dim=model.particle_count,
+            inputs=[model.particle_inv_mass, self.particle_group, held],
+            device=self.device,
+        )
+        if self.particle_enable_self_contact and model.tri_count:
+            wp.launch(
+                kernel=mark_held_self_contact_groups,
+                dim=model.particle_count,
+                inputs=[self.trimesh_collision_info, model.tri_indices, self.particle_group, held],
+                device=self.device,
+            )
+        if (
+            contacts is not None
+            and contacts.soft_contact_count is not None
+            and contacts.soft_contact_particle is not None
+            and contacts.soft_contact_particle.shape[0] > 0
+        ):
+            wp.launch(
+                kernel=mark_held_contact_groups,
+                dim=contacts.soft_contact_particle.shape[0],
+                inputs=[contacts.soft_contact_count, contacts.soft_contact_particle, self.particle_group, held],
+                device=self.device,
+            )
 
     def _refresh_rigid_contact_state(
         self, contacts: Contacts | None, refresh: bool, *, restore_history: bool = False
