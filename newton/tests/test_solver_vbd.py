@@ -4695,6 +4695,64 @@ add_function_test(
 )
 
 
+def _thin_slab(device, speed: float):
+    """A free 20 x 1 x 20 cm foam slab moving straight down at ``speed`` with no gravity: 1 cm cubes (one across),
+    each split into six tets around the same body diagonal, so the surface has edge pairs closer than the contact
+    query radius around the rim."""
+    n, cell = 20, 0.01
+    i, j, k = np.meshgrid(np.arange(n + 1), np.arange(2), np.arange(n + 1), indexing="ij")
+    points = np.stack([i * cell - 0.1, j * cell + 2.0, k * cell - 0.1], axis=-1).reshape(-1, 3)
+
+    def index(a, b, c):
+        return (a * 2 + b) * (n + 1) + c
+
+    ci, ck = (axis.ravel() for axis in np.meshgrid(np.arange(n), np.arange(n), indexing="ij"))
+    corner = [index(ci + a, b, ck + c) for a in (0, 1) for b in (0, 1) for c in (0, 1)]
+    pattern = ((0, 4, 6, 7), (0, 4, 5, 7), (0, 1, 5, 7), (0, 1, 3, 7), (0, 2, 3, 7), (0, 2, 6, 7))
+    tets = np.concatenate([np.stack([corner[a], corner[b], corner[c], corner[d]], axis=1) for a, b, c, d in pattern])
+    p = points[tets]
+    flip = np.einsum("ij,ij->i", np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]), p[:, 3] - p[:, 0]) < 0
+    tets[flip] = tets[flip][:, [0, 2, 1, 3]]
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, 0.0, 0.0))
+    builder.add_soft_mesh(pos=wp.vec3(0.0, 0.0, 0.0), rot=wp.quat_identity(), scale=1.0,
+                          vel=wp.vec3(0.0, -speed, 0.0), vertices=[wp.vec3(*q) for q in points],
+                          indices=tets.reshape(-1).tolist(), density=50.0, k_mu=3.85e3, k_lambda=5.77e3, k_damp=25.0,
+                          particle_radius=0.001)
+    builder.color()
+    return builder.finalize(device=device)
+
+
+def _particle_self_contact_co_moving_pairs(test, device):
+    """A thin body keeps its shape at speed under speculative self-contact: a slab one tet thick moving at 8 m/s
+    (1.3 cm per 1/600 s step, about twice the contact query radius) keeps its 1 cm thickness and its speed. Its rim
+    edge pairs are within two rings of each other through the slab; with one-sided edge-edge filtering they were still
+    detected, their fixed division planes cut the leading side short, and the slab stretched to over twice its
+    thickness (fixed by #5024). A cube landing fast on a plate still never passes through it."""
+    dt = 1.0 / 600.0
+    options = {"iterations": 10, "particle_enable_self_contact": True, "particle_self_contact_margin": 0.002,
+               "particle_self_contact_gap": 0.004, "particle_self_contact_speculative": True}
+    model = _thin_slab(device, 8.0)
+    start = model.particle_q.numpy()
+    end = _run_particles(model, newton.solvers.SolverVBD(model, **options), steps=150, dt=dt)
+    test.assertAlmostEqual(float(np.ptp(end[:, 1])), 0.01, delta=1.0e-4)
+    test.assertAlmostEqual(float(start[:, 1].mean() - end[:, 1].mean()), 8.0 * 150 * dt, delta=1.0e-3)
+
+    model = _cube_over_plate(device)
+    cube = np.arange(model.particle_count)[model.particle_q.numpy()[:, 1] > 0.5]
+    landed = _run_particles(model, newton.solvers.SolverVBD(model, **options), steps=480, dt=dt)  # lands at 5.4 m/s
+    test.assertTrue(np.isfinite(landed).all())
+    plate = np.setdiff1d(np.arange(model.particle_count), cube)
+    test.assertGreater(landed[cube, 1].min(), landed[plate, 1].min())
+
+
+add_function_test(
+    TestSolverVBD,
+    "test_particle_self_contact_co_moving_pairs",
+    _particle_self_contact_co_moving_pairs,
+    devices=devices,
+)
+
+
 def _jittered_block(device):
     """A soft 12 cm block on a 2 cm tet grid with its nodes jittered (fixed seed), so the mesh has no symmetry,
     starting 2 cm above a frictionless ground plane."""
