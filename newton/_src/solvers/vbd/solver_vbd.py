@@ -63,7 +63,18 @@ from .particle_vbd_kernels import (
     apply_planar_truncation_parallel_by_collision,
     apply_truncation_ts,
     build_particle_body_contact_adjacency_active,
+    comoving_accumulate_cluster_momentum,
+    comoving_apply_truncation_ts,
+    comoving_cluster_properties,
+    comoving_compress_cluster_labels,
+    comoving_join_edge_edge_clusters,
+    comoving_join_vertex_triangle_clusters,
+    comoving_relative_displacements,
+    comoving_reset_cluster_labels,
     compute_speculative_particle_caps,
+    accumulate_cluster_momentum,
+    accumulate_group_momentum,
+    group_mean_speed,
     # Solver kernels (particle VBD)
     forward_step,
     mark_held_contact_groups,
@@ -226,6 +237,8 @@ def _validate_compliant_alm_material_coefficient(
 # is never clipped; small because pairs grow with the square of the reach (a larger factor overflows the contact
 # buffers near impacts, and overflow shrinks the caps, which brakes the bodies).
 _SPECULATIVE_CAP_FACTOR = 1.25
+# Co-moving truncation: particles per block in the tiled sum of a cluster's shared move.
+_COMOVING_BLOCK = 128
 
 def _particle_groups(model: Model) -> np.ndarray:
     """Connected-component label (0..groups-1) of every particle, joined by tets, triangles, edges and springs."""
@@ -501,6 +514,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         particle_external_edge_contact_filtering_map: dict | None = None,
         particle_initial_guess: Literal["inertia", "adaptive"] = "inertia",
         particle_self_contact_speculative: bool = False,
+        particle_self_contact_comoving_truncation: bool = False,
         # Rigid body - constraint formulation and stabilization
         rigid_compliant_alm: bool = _DEPRECATED_RIGID_COMPLIANT_ALM_UNSET,
         rigid_avbd_alpha: float | None = None,  # Shared alpha override; None uses zero
@@ -629,6 +643,21 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 detect. Contacts within one body keep the fixed query radius, so a body folding onto itself faster
                 than the fixed limit is not guaranteed penetration-free. Requires VBD's own self-contact detector
                 (no ``collision_pipeline``).
+            particle_self_contact_comoving_truncation: With self-contact, the penetration-free truncation stops
+                each side of a detected pair short of the pair's division plane. Two sides moving together (a pair
+                within one falling body, or a body resting on another as both fall) are cut short there too, although
+                their gap is not closing. The cut-short side lags, the body deforms, more pairs appear, and it runs
+                away: a thin falling body whose close surface pairs lie beyond the topological filter (an irregular
+                mesh about one tet thick) stretches once it moves fast. With this on, particles are grouped into
+                clusters (each connected body joined with every body it has a detected pair with), and the
+                truncation runs on each particle's displacement relative to its cluster's mass-weighted mean
+                displacement; every particle of a cluster gets that mean move, plus its truncated relative move. The
+                mean move is the same for both sides of every detected pair, so the penetration-free guarantee is
+                kept. A cluster with a fixed, kinematic or inactive particle gets no shared move (the existing
+                truncation), and the shared plus relative move stays within each particle's limit (the speculative
+                cap, or the fixed limit). With speculative self-contact, the caps also follow each body's and its
+                previous cluster's mean speed. Requires VBD's own self-contact detector (no ``collision_pipeline``)
+                and is not combined with ``rigid_soft_enable_dat`` (a rigid shape is not part of any cluster).
 
             rigid_compliant_alm: Deprecated; omit it. Compliant ALM is always used for
                 body-body contacts, structural joints, drives, and limits. Explicit
@@ -1099,6 +1128,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             enable_fast_math,
             particle_initial_guess,
             particle_self_contact_speculative,
+            particle_self_contact_comoving_truncation,
         )
 
         # Routed tendon geometry and material state are shared with XPBD; VBD
@@ -1200,6 +1230,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         enable_fast_math: bool,
         particle_initial_guess: str = "inertia",
         particle_self_contact_speculative: bool = False,
+        particle_self_contact_comoving_truncation: bool = False,
     ):
         """Initialize particle-specific data structures and settings."""
         if particle_initial_guess not in ("inertia", "adaptive"):
@@ -1221,7 +1252,21 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             return
         if self.particle_self_contact_speculative and self.collision_pipeline is not None:
             raise ValueError("particle_self_contact_speculative needs VBD's own self-contact detector (no collision_pipeline)")
-        if particle_initial_guess == "adaptive" or self.particle_self_contact_speculative:
+        self.particle_self_contact_comoving_truncation = bool(
+            particle_self_contact_comoving_truncation and self.particle_enable_self_contact
+        )
+        if self.particle_self_contact_comoving_truncation:
+            if self.collision_pipeline is not None:
+                raise ValueError(
+                    "particle_self_contact_comoving_truncation needs VBD's own self-contact detector (no collision_pipeline)"
+                )
+            if self.rigid_soft_enable_dat:
+                raise ValueError("particle_self_contact_comoving_truncation does not support rigid_soft_enable_dat")
+        if (
+            particle_initial_guess == "adaptive"
+            or self.particle_self_contact_speculative
+            or self.particle_self_contact_comoving_truncation
+        ):
             groups = _particle_groups(model)
             self.particle_group = wp.array(groups, dtype=wp.int32, device=self.device)
         if particle_initial_guess == "adaptive":
@@ -1229,6 +1274,17 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             self.particle_group_held = wp.zeros(int(groups.max()) + 1, dtype=wp.int32, device=self.device)
         if self.particle_self_contact_speculative:
             self.particle_speculative_caps = wp.zeros(model.particle_count, dtype=float, device=self.device)
+        if self.particle_self_contact_comoving_truncation:
+            count = int(groups.max()) + 1
+            self._comoving_group_count = count
+            self._comoving_labels = wp.zeros(count, dtype=wp.int32, device=self.device)
+            self._comoving_mass = wp.zeros(count, dtype=float, device=self.device)
+            self._comoving_momentum = wp.zeros(count, dtype=wp.vec3, device=self.device)
+            self._comoving_held = wp.zeros(count, dtype=wp.int32, device=self.device)
+            self._comoving_cap = wp.zeros(count, dtype=float, device=self.device)
+            self._comoving_move = wp.zeros(count, dtype=wp.vec3, device=self.device)
+            self._comoving_relative = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+            self._comoving_group_speed = wp.zeros(count, dtype=float, device=self.device)
         self._particle_step_dt = 0.0
 
         self.particle_collision_detection_interval = particle_collision_detection_interval
@@ -3515,6 +3571,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         if rigid_dat_active:
             max_displacement = min(max_displacement, self._rigid_dat_particle_max_displacement)
 
+        if self.particle_self_contact_comoving_truncation:
+            self._comoving_truncation(state, max_displacement)
+            return
+
         self.truncation_ts.fill_(1.0)
 
         if self.particle_enable_self_contact:
@@ -3603,6 +3663,58 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 ],
                 device=self.device,
             )
+
+    def _comoving_truncation(self, state: State, max_displacement: float):
+        """Planar truncation of each particle's move relative to its cluster's shared move (see
+        ``particle_self_contact_comoving_truncation``). Cluster mass, held flags and smallest caps come from
+        ``_comoving_update_clusters``; only the displacement sums change between calls."""
+        model = self.model
+        count = model.particle_count
+        caps = self.particle_speculative_caps
+        fixed_limit = self._self_contact_query_radius * self.dat_conservative_bound_relaxation * 0.5
+        move_limit = fixed_limit if caps is None else 1.0e30
+        block = _COMOVING_BLOCK if self.device.is_cuda else 1  # Warp runs CPU tiles one thread per block
+        self._comoving_momentum.zero_()
+        wp.launch_tiled(
+            comoving_accumulate_cluster_momentum,
+            dim=[(count + block - 1) // block],
+            inputs=[self.particle_displacements, model.particle_inv_mass, model.particle_flags, self.particle_group,
+                    self._comoving_labels, count],
+            outputs=[self._comoving_momentum],
+            block_dim=block,
+            device=self.device,
+        )
+        clusters = [self._comoving_mass, self._comoving_momentum, self._comoving_held, self._comoving_cap, move_limit]
+        wp.launch(
+            comoving_relative_displacements,
+            dim=count,
+            inputs=[self.particle_displacements, self.particle_group, self._comoving_labels, *clusters],
+            outputs=[self._comoving_relative],
+            device=self.device,
+        )
+        self.truncation_ts.fill_(1.0)
+        wp.launch(
+            kernel=apply_planar_truncation_parallel_by_collision,
+            inputs=[
+                self.pos_prev_collision_detection,
+                self._comoving_relative,
+                model.tri_indices,
+                model.edge_indices,
+                self.trimesh_collision_info,
+                self.dat_conservative_bound_relaxation,
+            ],
+            outputs=[self.truncation_ts],
+            dim=self.particle_self_contact_evaluation_kernel_launch_size,
+            device=self.device,
+        )
+        wp.launch(
+            comoving_apply_truncation_ts,
+            dim=count,
+            inputs=[self.pos_prev_collision_detection, self._comoving_relative, self.truncation_ts,
+                    self.particle_group, self._comoving_labels, *clusters, max_displacement, caps],
+            outputs=[self.particle_displacements, state.particle_q],
+            device=self.device,
+        )
 
     def _apply_particle_kinematic_prologue(self, state_in: State, control: Control) -> None:
         """Record particle start positions and move kinematic particles to their targets before detection."""
@@ -5520,6 +5632,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             self.collision_pipeline._detect_soft_self_contact(current_state.particle_q, self._pipeline_contacts)
         elif self.particle_self_contact_speculative:
             relaxation = self.dat_conservative_bound_relaxation
+            group_speed = None
+            if self.particle_self_contact_comoving_truncation:
+                group_speed = self._comoving_group_speeds(current_state)
             wp.launch(
                 kernel=compute_speculative_particle_caps,
                 dim=self.model.particle_count,
@@ -5530,6 +5645,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self._particle_step_dt,
                     self._self_contact_query_radius * relaxation * 0.5,
                     _SPECULATIVE_CAP_FACTOR,
+                    self.particle_group if group_speed is not None else None,
+                    group_speed,
                 ],
                 outputs=[self.particle_speculative_caps],
                 device=self.device,
@@ -5558,6 +5675,81 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 min_query_radius=self.particle_rest_shape_contact_exclusion_radius,
                 min_distance_filtering_ref_pos=self.particle_q_rest,
             )
+
+        if self.particle_self_contact_comoving_truncation:
+            self._comoving_update_clusters()
+
+    def _comoving_group_speeds(self, current_state: State):
+        """Caps follow each body's mean speed too, so the move a cluster shares is not capped by its slowest particle;
+        detection reaches as far as these caps, so the guarantee is unchanged. Clusters are found by the detection
+        that follows; the previous one's labels say which bodies move together."""
+        group_speed = self._comoving_group_speed
+        self._comoving_mass.zero_()
+        self._comoving_momentum.zero_()
+        wp.launch(
+            accumulate_group_momentum,
+            dim=self.model.particle_count,
+            inputs=[current_state.particle_qd, self.model.particle_inv_mass, self.model.particle_flags,
+                    self.particle_group],
+            outputs=[self._comoving_mass, self._comoving_momentum],
+            device=self.device,
+        )
+        self._comoving_cap.zero_()  # scratch: cluster mass
+        self._comoving_move.zero_()  # scratch: cluster momentum
+        wp.launch(
+            accumulate_cluster_momentum,
+            dim=self._comoving_group_count,
+            inputs=[self._comoving_mass, self._comoving_momentum, self._comoving_labels],
+            outputs=[self._comoving_cap, self._comoving_move],
+            device=self.device,
+        )
+        wp.launch(
+            group_mean_speed,
+            dim=self._comoving_group_count,
+            inputs=[self._comoving_mass, self._comoving_momentum, self._comoving_labels, self._comoving_cap,
+                    self._comoving_move],
+            outputs=[group_speed],
+            device=self.device,
+        )
+        return group_speed
+
+    def _comoving_update_clusters(self):
+        """Cluster labels per group: connected bodies joined through this detection's pairs, then each cluster's
+        mass, held flag and smallest cap (fixed until the next detection)."""
+        model = self.model
+        labels = self._comoving_labels
+        count = self._comoving_group_count
+        wp.launch(comoving_reset_cluster_labels, dim=count, outputs=[labels], device=self.device)
+        for _ in range(count - 1):  # a chain of n groups needs at most n - 1 joins (none for one group)
+            if model.tri_count:
+                wp.launch(
+                    comoving_join_vertex_triangle_clusters,
+                    dim=model.particle_count,
+                    inputs=[self.trimesh_collision_info, model.tri_indices, self.particle_group],
+                    outputs=[labels],
+                    device=self.device,
+                )
+            if model.edge_count:
+                wp.launch(
+                    comoving_join_edge_edge_clusters,
+                    dim=model.edge_count,
+                    inputs=[self.trimesh_collision_info, model.edge_indices, self.particle_group],
+                    outputs=[labels],
+                    device=self.device,
+                )
+            wp.launch(comoving_compress_cluster_labels, dim=count, outputs=[labels], device=self.device)
+        caps = self.particle_speculative_caps
+        fixed_limit = self._self_contact_query_radius * self.dat_conservative_bound_relaxation * 0.5
+        self._comoving_mass.zero_()
+        self._comoving_held.zero_()
+        self._comoving_cap.fill_(fixed_limit if caps is None else 1.0e30)
+        wp.launch(
+            comoving_cluster_properties,
+            dim=model.particle_count,
+            inputs=[model.particle_inv_mass, model.particle_flags, self.particle_group, labels, caps],
+            outputs=[self._comoving_mass, self._comoving_held, self._comoving_cap],
+            device=self.device,
+        )
 
     def rebuild_bvh(self, state: State):
         """This function will rebuild the BVHs used for detecting self-contacts using the input `state`.

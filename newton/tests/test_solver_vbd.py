@@ -10774,5 +10774,76 @@ add_function_test(
     TestSolverVBD, "test_particle_self_contact_speculative", _particle_self_contact_speculative, devices=devices
 )
 
+
+def _thin_slab(device, speed: float):
+    """A free 20 x 1 x 20 cm foam slab moving straight down at ``speed`` with no gravity: 1 cm cubes (one across),
+    each split into six tets around the same body diagonal, so the surface has edge pairs closer than the contact
+    query radius around the rim."""
+    n, cell = 20, 0.01
+    i, j, k = np.meshgrid(np.arange(n + 1), np.arange(2), np.arange(n + 1), indexing="ij")
+    points = np.stack([i * cell - 0.1, j * cell + 2.0, k * cell - 0.1], axis=-1).reshape(-1, 3)
+
+    def index(a, b, c):
+        return (a * 2 + b) * (n + 1) + c
+
+    ci, ck = (axis.ravel() for axis in np.meshgrid(np.arange(n), np.arange(n), indexing="ij"))
+    corner = [index(ci + a, b, ck + c) for a in (0, 1) for b in (0, 1) for c in (0, 1)]
+    pattern = ((0, 4, 6, 7), (0, 4, 5, 7), (0, 1, 5, 7), (0, 1, 3, 7), (0, 2, 3, 7), (0, 2, 6, 7))
+    tets = np.concatenate([np.stack([corner[a], corner[b], corner[c], corner[d]], axis=1) for a, b, c, d in pattern])
+    p = points[tets]
+    flip = np.einsum("ij,ij->i", np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]), p[:, 3] - p[:, 0]) < 0
+    tets[flip] = tets[flip][:, [0, 2, 1, 3]]
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, 0.0, 0.0))
+    builder.add_soft_mesh(pos=wp.vec3(0.0, 0.0, 0.0), rot=wp.quat_identity(), scale=1.0,
+                          vel=wp.vec3(0.0, -speed, 0.0), vertices=[wp.vec3(*q) for q in points],
+                          indices=tets.reshape(-1).tolist(), density=50.0, k_mu=3.85e3, k_lambda=5.77e3, k_damp=25.0,
+                          particle_radius=0.001)
+    builder.color()
+    return builder.finalize(device=device)
+
+
+def _particle_self_contact_comoving_truncation(test, device):
+    """Truncation cuts a step's move where it reaches the pair's division plane, also when both sides of the pair move
+    together and their gap is not closing. A thin slab moving at 8 m/s (1.3 cm per 1/600 s step) is cut short around
+    its rim, lags there and stretches; ``particle_self_contact_comoving_truncation`` truncates moves relative to the
+    cluster's shared move, so it keeps its shape and its speed. On this regular grid the default two-ring filter
+    removes the rim pairs, so the test filters one ring only, as on an irregular (for example TetWild) thin mesh,
+    whose close surface pairs lie beyond two rings: a 150 x 150 x 1 cm sheet of 54k such tets falling from rest
+    stretches to 40 cm in 0.4 s without the option and stays 1.2 cm with it. The cube still lands on the plate
+    without passing through it."""
+    dt = 1.0 / 600.0
+    options = {"iterations": 10, "particle_enable_self_contact": True, "particle_self_contact_margin": 0.002,
+               "particle_self_contact_gap": 0.004, "particle_self_contact_speculative": True,
+               "particle_topological_contact_filter_threshold": 1}
+
+    def slab(comoving: bool) -> tuple[float, float]:
+        model = _thin_slab(device, 8.0)
+        start = model.particle_q.numpy()
+        solver = newton.solvers.SolverVBD(model, particle_self_contact_comoving_truncation=comoving, **options)
+        end = _run_particles(model, solver, steps=150, dt=dt)
+        return float(np.ptp(end[:, 1])), float(start[:, 1].mean() - end[:, 1].mean())
+
+    thickness, _moved = slab(False)
+    test.assertGreater(thickness, 0.02)  # stretched to over twice its thickness
+    thickness, moved = slab(True)
+    test.assertAlmostEqual(thickness, 0.01, delta=1.0e-4)
+    test.assertAlmostEqual(moved, 8.0 * 150 * dt, delta=1.0e-3)
+
+    model = _cube_over_plate(device)
+    cube = np.arange(model.particle_count)[model.particle_q.numpy()[:, 1] > 0.5]
+    solver = newton.solvers.SolverVBD(model, particle_self_contact_comoving_truncation=True, **options)
+    landed = _run_particles(model, solver, steps=480, dt=dt)  # 0.8 s: landed at 5.4 m/s
+    test.assertTrue(np.isfinite(landed).all())
+    plate = np.setdiff1d(np.arange(model.particle_count), cube)
+    test.assertGreater(landed[cube, 1].min(), landed[plate, 1].min())
+
+
+add_function_test(
+    TestSolverVBD,
+    "test_particle_self_contact_comoving_truncation",
+    _particle_self_contact_comoving_truncation,
+    devices=devices,
+)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, failfast=True)
