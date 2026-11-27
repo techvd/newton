@@ -1407,6 +1407,41 @@ def step_displacement(
 
 
 @wp.kernel
+def accumulate_triangle_drag(
+    tri_indices: wp.array2d[wp.int32],
+    tri_materials: wp.array2d[float],
+    pos: wp.array[wp.vec3],
+    vel: wp.array[wp.vec3],
+    # output
+    force: wp.array[wp.vec3],
+):
+    """Still-air pressure drag of each triangle with ``tri_materials[:, 3] = k_drag > 0``, added to its vertices.
+
+    The face moves through still air at its vertices' mean velocity ``v`` at the step start; pressure drag acts along
+    its unit normal ``n``: ``F = -k_drag A (n.v)|n.v| n`` with ``A`` its current area and ``k_drag = rho_air C_d / 2``
+    [kg/m^3], one third to each vertex. For motion normal to the face this is SolverSemiImplicit's ``tri_drag``
+    force; motion in the face's plane meets none (skin friction, about 1% of the pressure drag, is left out).
+    """
+    tid = wp.tid()
+    k_drag = tri_materials[tid, 3]
+    if k_drag <= 0.0:
+        return
+    i = tri_indices[tid, 0]
+    j = tri_indices[tid, 1]
+    k = tri_indices[tid, 2]
+    normal = wp.cross(pos[j] - pos[i], pos[k] - pos[i])
+    double_area = wp.length(normal)
+    if double_area < 1.0e-20:
+        return
+    n = normal / double_area
+    vn = wp.dot(n, (vel[i] + vel[j] + vel[k]) / 3.0)
+    share = -(k_drag * 0.5 * double_area / 3.0) * vn * wp.abs(vn) * n
+    wp.atomic_add(force, i, share)
+    wp.atomic_add(force, j, share)
+    wp.atomic_add(force, k, share)
+
+
+@wp.kernel
 def forward_step(
     dt: float,
     gravity: wp.array[wp.vec3],

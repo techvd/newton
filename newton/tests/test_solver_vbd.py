@@ -4966,6 +4966,71 @@ def _particle_static_friction(test, device):
 
 add_function_test(TestSolverVBD, "test_particle_static_friction", _particle_static_friction, devices=devices)
 
+def _falling_sheet(device, rot, tri_drag: float, vel=(0.0, 0.0, 0.0), gravity=-9.81):
+    """A 1 x 1 m cloth sheet (16 x 16 cells, 150 g/m^2 lumped by area, 1 kN/m membrane) at y = 10 m, its +z normal
+    turned by ``rot``."""
+    n = 16
+    i, j = np.meshgrid(np.arange(n + 1), np.arange(n + 1), indexing="ij")
+    vertices = [wp.vec3(float(a) / n - 0.5, float(b) / n - 0.5, 0.0) for a, b in zip(i.ravel(), j.ravel(), strict=True)]
+    indices = []
+    for a in range(n):
+        for b in range(n):
+            p00, p10, p01, p11 = a * (n + 1) + b, (a + 1) * (n + 1) + b, a * (n + 1) + b + 1, (a + 1) * (n + 1) + b + 1
+            indices += [p00, p10, p11, p00, p11, p01]
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, gravity, 0.0))
+    builder.add_cloth_mesh(
+        pos=wp.vec3(0.0, 10.0, 0.0),
+        rot=rot,
+        scale=1.0,
+        vel=wp.vec3(*vel),
+        vertices=vertices,
+        indices=indices,
+        density=0.15,
+        tri_ke=385.0,
+        tri_ka=330.0,
+        tri_kd=0.0,
+        edge_ke=1.0e-4,
+        tri_drag=tri_drag,
+    )
+    builder.color(include_bending=True)
+    return builder.finalize(device=device)
+
+
+def _mean_velocity(model, steps: int, dt: float) -> np.ndarray:
+    solver = newton.solvers.SolverVBD(model, iterations=10)
+    state, following, control = model.state(), model.state(), model.control()
+    for _ in range(steps):
+        state.clear_forces()
+        solver.step(state, following, control, None, dt)
+        state, following = following, state
+    return state.particle_qd.numpy().mean(axis=0)
+
+
+def _particle_triangle_drag(test, device):
+    """``tri_drag`` (``k = rho C_d / 2``) is still-air pressure drag along each face's normal in SolverVBD.
+
+    A 150 g/m^2 sheet dropped flat reaches the terminal speed ``sqrt(w g / k)``, where the drag on its area balances
+    its weight (1.45 m/s for air at 1.2 kg/m^3 and a flat plate's C_d = 1.17). Without drag it falls freely, as it
+    does edge-on with drag (no normal motion), and a sheet gliding in its own plane keeps its speed.
+    """
+    dt = 1.0 / 600.0
+    flat = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), -0.5 * wp.pi)  # the grid's +z normal turned to +y
+    k = 0.5 * 1.2 * 1.17
+    terminal = math.sqrt(0.15 * 9.81 / k)
+    falling = _mean_velocity(_falling_sheet(device, flat, k), steps=600, dt=dt)
+    test.assertAlmostEqual(float(-falling[1]), terminal, delta=0.02 * terminal)
+    test.assertLess(float(np.abs(falling[[0, 2]]).max()), 1.0e-3)
+
+    free = _mean_velocity(_falling_sheet(device, flat, 0.0), steps=300, dt=dt)
+    test.assertAlmostEqual(float(-free[1]), 9.81 * 0.5, delta=0.01 * 9.81 * 0.5)
+    edge_on = _mean_velocity(_falling_sheet(device, wp.quat_identity(), k), steps=300, dt=dt)
+    test.assertAlmostEqual(float(-edge_on[1]), 9.81 * 0.5, delta=0.01 * 9.81 * 0.5)
+    gliding = _mean_velocity(_falling_sheet(device, flat, k, vel=(2.0, 0.0, 0.0), gravity=0.0), steps=300, dt=dt)
+    test.assertAlmostEqual(float(gliding[0]), 2.0, delta=1.0e-3)
+
+
+add_function_test(TestSolverVBD, "test_particle_triangle_drag", _particle_triangle_drag, devices=devices)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, failfast=True)
 

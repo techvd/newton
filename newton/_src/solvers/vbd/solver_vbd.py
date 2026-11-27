@@ -64,6 +64,7 @@ from .particle_vbd_kernels import (
     rigid_mode_solve,
     rebase_displacements,
     update_step_moves,
+    accumulate_triangle_drag,
     # Solver kernels (particle VBD)
     finalize_particle_step,
     forward_step,
@@ -1051,6 +1052,12 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.particle_q_residual_owner = wp.zeros_like(model.particle_q, device=self.device)
         # each particle's exact move since the step start, for the damping rates (update_step_moves)
         self.particle_step_move = wp.zeros_like(model.particle_q, device=self.device)
+        # still-air triangle drag (``tri_materials[:, 3]``, ``tri_drag``): an external force, so it is applied in full
+        # through the inertial target like gravity (see ``_external_particle_forces``)
+        self._tri_drag = bool(
+            model.tri_count and model.tri_materials is not None and float(model.tri_materials.numpy()[:, 3].max()) > 0.0
+        )
+        self._particle_external_force = wp.zeros_like(model.particle_q, device=self.device) if self._tri_drag else None
 
         # Particle adjacency info: reuse the shared device copy built once at finalize (the VBD
         # solver and the collision pipeline both use it, so it is uploaded only once).
@@ -2920,7 +2927,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 state_in.particle_q,
                 state_in.particle_qd,
                 self.model.particle_inv_mass,
-                state_in.particle_f,
+                self._external_particle_forces(state_in),
                 self.model.particle_flags,
                 self.particle_qd_prev_step,
                 self.particle_group,
@@ -2937,6 +2944,27 @@ class SolverVBD(SolverBase, CouplingInterface):
         )
 
         self._penetration_free_truncation(state_in.particle_q)
+
+    def _external_particle_forces(self, state_in: State):
+        """``state_in.particle_f`` plus the triangles' still-air drag (``tri_drag``) from the step-start velocities.
+
+        Drag is evaluated once per step and enters the inertial target with the other external forces, so it acts in
+        full whatever the iteration count. As an elastic term it would not: the membrane's projected Hessian stiffens
+        the out-of-plane direction, and a truncated solve realized about an eighth of a normal force per iteration.
+        Evaluated explicitly it is stable while ``dt < 2 m / (k_drag A |v_n|)`` (0.4 s for a 150 g/m^2 sheet at 1 m/s).
+        """
+        if not self._tri_drag:
+            return state_in.particle_f
+        force = self._particle_external_force
+        wp.copy(force, state_in.particle_f)
+        wp.launch(
+            kernel=accumulate_triangle_drag,
+            dim=self.model.tri_count,
+            inputs=[self.model.tri_indices, self.model.tri_materials, state_in.particle_q, state_in.particle_qd],
+            outputs=[force],
+            device=self.device,
+        )
+        return force
 
     def _mark_held_particle_groups(self, contacts: Contacts | None) -> None:
         """Flag each particle group held this step: a fixed particle, a self-contact, or a body-particle contact."""
