@@ -1886,6 +1886,16 @@ def convert_body_particle_contact_data_kernel(
         body_particle_contact_buffer[offset + contact_counter] = contact_index
 
 
+@wp.func
+def combine_contact_ke(side_a: float, side_b: float):
+    """A contact's stiffness from its two sides' stiffnesses: the harmonic mean, which is two springs in series scaled
+    so that two equal sides keep their value; the softer side governs."""
+    total = side_a + side_b
+    if total <= 0.0:
+        return 0.0
+    return 2.0 * side_a * side_b / total
+
+
 @wp.kernel
 def accumulate_self_contact_force_and_hessian(
     # inputs
@@ -1900,6 +1910,7 @@ def accumulate_self_contact_force_and_hessian(
     collision_info_array: wp.array[TriMeshCollisionInfo],
     collision_radius: float,
     soft_contact_ke: float,
+    particle_contact_ke: wp.array[float],
     soft_contact_kd: float,
     friction_mu: float,
     friction_epsilon: float,
@@ -1931,6 +1942,14 @@ def accumulate_self_contact_force_and_hessian(
                 c_e1_v1 = particle_colors[e1_v1]
                 c_e1_v2 = particle_colors[e1_v2]
                 if c_e1_v1 == current_color or c_e1_v2 == current_color:
+                    contact_ke = soft_contact_ke
+                    if particle_contact_ke:
+                        contact_ke = combine_contact_ke(
+                            wp.min(particle_contact_ke[e1_v1], particle_contact_ke[e1_v2]),
+                            wp.min(
+                                particle_contact_ke[edge_indices[e2_idx, 2]], particle_contact_ke[edge_indices[e2_idx, 3]]
+                            ),
+                        )
                     has_contact, collision_force_0, collision_force_1, collision_hessian_0, collision_hessian_1 = (
                         evaluate_edge_edge_contact_2_vertices(
                             e1_idx,
@@ -1939,7 +1958,7 @@ def accumulate_self_contact_force_and_hessian(
                             pos_prev,
                             edge_indices,
                             collision_radius,
-                            soft_contact_ke,
+                            contact_ke,
                             soft_contact_kd,
                             friction_mu,
                             friction_epsilon,
@@ -1985,6 +2004,14 @@ def accumulate_self_contact_force_and_hessian(
                     or c_tri_b == current_color
                     or c_tri_c == current_color
                 ):
+                    contact_ke = soft_contact_ke
+                    if particle_contact_ke:
+                        contact_ke = combine_contact_ke(
+                            particle_contact_ke[particle_idx],
+                            wp.min(
+                                particle_contact_ke[tri_a], wp.min(particle_contact_ke[tri_b], particle_contact_ke[tri_c])
+                            ),
+                        )
                     (
                         has_contact,
                         collision_force_0,
@@ -2002,7 +2029,7 @@ def accumulate_self_contact_force_and_hessian(
                         pos_prev,
                         tri_indices,
                         collision_radius,
-                        soft_contact_ke,
+                        contact_ke,
                         soft_contact_kd,
                         friction_mu,
                         friction_epsilon,

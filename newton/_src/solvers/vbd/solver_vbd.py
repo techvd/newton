@@ -362,6 +362,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         particle_rigid_mode_correction: bool = False,
         particle_static_friction: bool = False,
         particle_self_contact_comoving_truncation: bool = False,
+        particle_contact_ke: np.ndarray | wp.array | None = None,
         # Rigid body - constraint formulation and stabilization
         rigid_compliant_alm: bool | None = None,  # None retains legacy and emits the scoped migration warning
         rigid_avbd_alpha: float | None = None,  # Shared alpha override; None uses mode defaults
@@ -505,6 +506,16 @@ class SolverVBD(SolverBase, CouplingInterface):
                 kept. A cluster with a fixed or inactive particle gets no shared move (the existing truncation), and
                 the shared plus relative move stays within each particle's limit (the speculative cap, or the fixed
                 limit).
+            particle_contact_ke: Per-particle contact stiffness [N/m], one value per particle, in place of the
+                model-wide ``model.soft_contact_ke`` on the particle side. A self-contact pair (vertex-triangle or
+                edge-edge, within one body or between two) uses the harmonic mean of its two sides (each side the
+                smallest value of its vertices): two springs in series, scaled so a body touching itself keeps its own
+                stiffness, and a soft body touching a much stiffer one is governed by the soft side. A particle-shape
+                contact averages the particle's value with the shape's material stiffness, as it does with the
+                model-wide value. With one model-wide value, a scene holding a stiff and a soft body has to give the
+                soft body's own near-surface contacts the stiff body's spring, which can blow it up. ``None`` (the
+                default) keeps ``model.soft_contact_ke`` everywhere. Damping and friction stay model-wide, and the
+                coupling proxy-force harvest keeps the model-wide stiffness.
 
             Rigid body parameters:
 
@@ -895,6 +906,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             particle_rigid_mode_correction,
             particle_static_friction,
             particle_self_contact_comoving_truncation,
+            particle_contact_ke,
         )
 
         # Initialize rigid body system and rigid-particle (body-particle) interaction state
@@ -946,8 +958,20 @@ class SolverVBD(SolverBase, CouplingInterface):
         particle_rigid_mode_correction: bool = False,
         particle_static_friction: bool = False,
         particle_self_contact_comoving_truncation: bool = False,
+        particle_contact_ke: np.ndarray | wp.array | None = None,
     ):
         """Initialize particle-specific data structures and settings."""
+        self.particle_contact_ke = None
+        if particle_contact_ke is not None and model.particle_count > 0:
+            values = particle_contact_ke.numpy() if isinstance(particle_contact_ke, wp.array) else particle_contact_ke
+            values = np.asarray(values, dtype=np.float64)
+            if values.shape != (model.particle_count,):
+                raise ValueError(
+                    f"particle_contact_ke must hold one value per particle ({model.particle_count}), got shape {values.shape}"
+                )
+            if not np.all(np.isfinite(values)) or np.any(values < 0.0):
+                raise ValueError("particle_contact_ke must contain finite, nonnegative values")
+            self.particle_contact_ke = wp.array(values, dtype=float, device=self.device)
         self.particle_static_friction = bool(particle_static_friction) and model.particle_count > 0
         count = model.particle_count if self.particle_static_friction else 0
         self.friction_anchor = wp.zeros(count, dtype=wp.vec3, device=self.device)
@@ -3129,6 +3153,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                 model.soft_contact_ke,
                 model.soft_contact_kd,
                 model.soft_contact_mu,
+                contacts.soft_contact_particle,
+                self.particle_contact_ke,
                 model.shape_material_ke,
                 model.shape_material_kd,
                 model.shape_material_mu,
@@ -3575,6 +3601,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.trimesh_collision_info,
                     self.particle_self_contact_margin,
                     self.model.soft_contact_ke,
+                    self.particle_contact_ke,
                     self.model.soft_contact_kd,
                     self.model.soft_contact_mu,
                     self.friction_epsilon,

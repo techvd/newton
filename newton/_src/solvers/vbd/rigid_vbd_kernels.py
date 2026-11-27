@@ -5011,6 +5011,8 @@ def init_body_particle_contacts(
     soft_contact_ke: float,
     soft_contact_kd: float,
     soft_contact_mu: float,
+    body_particle_contact_particle: wp.array[int],
+    particle_contact_ke: wp.array[float],
     shape_material_ke: wp.array[float],
     shape_material_kd: wp.array[float],
     shape_material_mu: wp.array[float],
@@ -5023,8 +5025,8 @@ def init_body_particle_contacts(
 ):
     """Cold-start body-particle contact penalties and cache material properties.
 
-    Averages particle-side material (scalar `soft_contact_ke/kd/mu`) with the
-    rigid shape's material. Penalty is seeded at ``min(k_start, avg_ke)`` when
+    Averages particle-side material (scalar `soft_contact_ke/kd/mu`, or the particle's own stiffness from
+    ``particle_contact_ke`` when given) with the rigid shape's material. Penalty is seeded at ``min(k_start, avg_ke)`` when
     ramping (k_start >= 0) or at ``avg_ke`` when fixed-k (k_start < 0).
     """
     i = wp.tid()
@@ -5034,9 +5036,14 @@ def init_body_particle_contacts(
         return
 
     shape_idx = body_particle_contact_shape[i]
+    particle_ke = soft_contact_ke
+    if particle_contact_ke:
+        particle = body_particle_contact_particle[i]
+        if particle >= 0:
+            particle_ke = particle_contact_ke[particle]
 
     avg_ke, avg_kd, avg_mu = _average_contact_material(
-        soft_contact_ke,
+        particle_ke,
         soft_contact_kd,
         soft_contact_mu,
         shape_material_ke[shape_idx],

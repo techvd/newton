@@ -1550,6 +1550,7 @@ def test_edge_topology_reciprocity(test, device):
                         wp.array([data], dtype=TriMeshCollisionInfo, device=device),  # 1.6 takes a one-element array
                         0.1,
                         100.0,
+                        None,  # particle_contact_ke: the model-wide stiffness
                         0.1,
                         1.5,
                         0.001,
