@@ -4753,6 +4753,50 @@ add_function_test(
 )
 
 
+def _particle_self_contact_comoving_truncation(test, device):
+    """Truncation cuts a step's move where it reaches the pair's division plane, also when both sides of the pair move
+    together and their gap is not closing. A thin slab moving at 8 m/s (1.3 cm per 1/600 s step) is cut short around
+    its rim, lags there and stretches; ``particle_self_contact_comoving_truncation`` truncates moves relative to the
+    cluster's shared move, so it keeps its shape and its speed. On this regular grid the default two-ring filter
+    removes the rim pairs, so the test filters one ring only, as on an irregular (for example TetWild) thin mesh,
+    whose close surface pairs lie beyond two rings: a 150 x 150 x 1 cm sheet of 54k such tets falling from rest
+    stretches to 40 cm in 0.4 s without the option and stays 1.2 cm with it. The cube still lands on the plate
+    without passing through it."""
+    dt = 1.0 / 600.0
+    options = {"iterations": 10, "particle_enable_self_contact": True, "particle_self_contact_margin": 0.002,
+               "particle_self_contact_gap": 0.004, "particle_self_contact_speculative": True,
+               "particle_topological_contact_filter_threshold": 1}
+
+    def slab(comoving: bool) -> tuple[float, float]:
+        model = _thin_slab(device, 8.0)
+        start = model.particle_q.numpy()
+        solver = newton.solvers.SolverVBD(model, particle_self_contact_comoving_truncation=comoving, **options)
+        end = _run_particles(model, solver, steps=150, dt=dt)
+        return float(np.ptp(end[:, 1])), float(start[:, 1].mean() - end[:, 1].mean())
+
+    thickness, _moved = slab(False)
+    test.assertGreater(thickness, 0.02)  # stretched to over twice its thickness
+    thickness, moved = slab(True)
+    test.assertAlmostEqual(thickness, 0.01, delta=1.0e-4)
+    test.assertAlmostEqual(moved, 8.0 * 150 * dt, delta=1.0e-3)
+
+    model = _cube_over_plate(device)
+    cube = np.arange(model.particle_count)[model.particle_q.numpy()[:, 1] > 0.5]
+    solver = newton.solvers.SolverVBD(model, particle_self_contact_comoving_truncation=True, **options)
+    landed = _run_particles(model, solver, steps=480, dt=dt)  # 0.8 s: landed at 5.4 m/s
+    test.assertTrue(np.isfinite(landed).all())
+    plate = np.setdiff1d(np.arange(model.particle_count), cube)
+    test.assertGreater(landed[cube, 1].min(), landed[plate, 1].min())
+
+
+add_function_test(
+    TestSolverVBD,
+    "test_particle_self_contact_comoving_truncation",
+    _particle_self_contact_comoving_truncation,
+    devices=devices,
+)
+
+
 def _jittered_block(device):
     """A soft 12 cm block on a 2 cm tet grid with its nodes jittered (fixed seed), so the mesh has no symmetry,
     starting 2 cm above a frictionless ground plane."""

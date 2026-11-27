@@ -45,7 +45,18 @@ from .particle_vbd_kernels import (
     # Planar DAT (Divide and Truncate) kernels
     apply_planar_truncation_parallel_by_collision,
     apply_truncation_ts,
+    comoving_accumulate_cluster_momentum,
+    comoving_apply_truncation_ts,
+    comoving_cluster_properties,
+    comoving_compress_cluster_labels,
+    comoving_join_edge_edge_clusters,
+    comoving_join_vertex_triangle_clusters,
+    comoving_relative_displacements,
+    comoving_reset_cluster_labels,
     compute_speculative_particle_caps,
+    accumulate_cluster_momentum,
+    accumulate_group_momentum,
+    group_mean_speed,
     rigid_mode_accumulate_mass,
     rigid_mode_accumulate_system,
     rigid_mode_apply,
@@ -133,6 +144,7 @@ def _rigid_lambda_retention(alpha: float, gamma: float, use_compliant_alm: bool)
 # Speculative self-contact: a particle's cap is this many times its free move this step. Above 1 so a free particle
 # is never clipped; small because pairs grow with the square of the reach (a larger factor overflows the contact
 # buffers near impacts, and overflow shrinks the caps, which brakes the bodies).
+_COMOVING_BLOCK = 128  # particles per block in the tiled sum of a cluster's shared move
 _SPECULATIVE_CAP_FACTOR = 1.25
 
 def _particle_groups(model: Model) -> np.ndarray:
@@ -349,6 +361,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         particle_self_contact_speculative: bool = False,
         particle_rigid_mode_correction: bool = False,
         particle_static_friction: bool = False,
+        particle_self_contact_comoving_truncation: bool = False,
         # Rigid body - constraint formulation and stabilization
         rigid_compliant_alm: bool | None = None,  # None retains legacy and emits the scoped migration warning
         rigid_avbd_alpha: float | None = None,  # Shared alpha override; None uses mode defaults
@@ -479,6 +492,19 @@ class SolverVBD(SolverBase, CouplingInterface):
                 the step slip; leaving contact or touching another shape drops the anchor. One anchor per particle
                 (a particle touching two shapes keeps whichever updates last). Self-contact and edge/face (full
                 surface) contacts keep the step slip.
+            particle_self_contact_comoving_truncation: With self-contact, the penetration-free truncation places a
+                division plane between each detected pair at the pair's start and stops each side short of it. The
+                plane does not move, so two sides moving together (a pair within one falling body, or a body resting
+                on another as both fall) are cut short as soon as one step's move reaches the plane, although their
+                gap is not closing. The cut-short side lags, the body deforms, more pairs appear, and it runs away: a
+                thin falling slab stretches above a move of about one gap per step. With this on, particles are
+                grouped into clusters (each connected body joined with every body it has a detected pair with), and
+                the truncation runs on each particle's displacement relative to its cluster's mass-weighted mean
+                displacement; every particle of a cluster gets that mean move, plus its truncated relative move. The
+                mean move is the same for both sides of every detected pair, so the penetration-free guarantee is
+                kept. A cluster with a fixed or inactive particle gets no shared move (the existing truncation), and
+                the shared plus relative move stays within each particle's limit (the speculative cap, or the fixed
+                limit).
 
             Rigid body parameters:
 
@@ -868,6 +894,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             particle_self_contact_speculative,
             particle_rigid_mode_correction,
             particle_static_friction,
+            particle_self_contact_comoving_truncation,
         )
 
         # Initialize rigid body system and rigid-particle (body-particle) interaction state
@@ -918,6 +945,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         particle_self_contact_speculative: bool = False,
         particle_rigid_mode_correction: bool = False,
         particle_static_friction: bool = False,
+        particle_self_contact_comoving_truncation: bool = False,
     ):
         """Initialize particle-specific data structures and settings."""
         self.particle_static_friction = bool(particle_static_friction) and model.particle_count > 0
@@ -943,7 +971,15 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.particle_speculative_caps = None
         if self.particle_self_contact_speculative and self.collision_pipeline is not None:
             raise ValueError("particle_self_contact_speculative needs VBD's own self-contact detector (no collision_pipeline)")
-        if particle_initial_guess == "adaptive" or self.particle_self_contact_speculative or self.particle_rigid_mode_correction:
+        self.particle_self_contact_comoving_truncation = bool(
+            particle_self_contact_comoving_truncation and self.particle_enable_self_contact
+        )
+        if (
+            particle_initial_guess == "adaptive"
+            or self.particle_self_contact_speculative
+            or self.particle_rigid_mode_correction
+            or self.particle_self_contact_comoving_truncation
+        ):
             groups = _particle_groups(model)
             self.particle_group = wp.array(groups, dtype=wp.int32, device=self.device)
         if particle_initial_guess == "adaptive":
@@ -951,6 +987,17 @@ class SolverVBD(SolverBase, CouplingInterface):
             self.particle_group_held = wp.zeros(int(groups.max()) + 1, dtype=wp.int32, device=self.device)
         if self.particle_self_contact_speculative:
             self.particle_speculative_caps = wp.zeros(model.particle_count, dtype=float, device=self.device)
+        if self.particle_self_contact_comoving_truncation:
+            count = int(groups.max()) + 1
+            self._comoving_group_count = count
+            self._comoving_labels = wp.zeros(count, dtype=wp.int32, device=self.device)
+            self._comoving_mass = wp.zeros(count, dtype=float, device=self.device)
+            self._comoving_momentum = wp.zeros(count, dtype=wp.vec3, device=self.device)
+            self._comoving_held = wp.zeros(count, dtype=wp.int32, device=self.device)
+            self._comoving_cap = wp.zeros(count, dtype=float, device=self.device)
+            self._comoving_move = wp.zeros(count, dtype=wp.vec3, device=self.device)
+            self._comoving_relative = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+            self._comoving_group_speed = wp.zeros(count, dtype=float, device=self.device)
         if self.particle_rigid_mode_correction:
             count = int(groups.max()) + 1
             self._rigid_group_mass = wp.zeros(count, dtype=float, device=self.device)
@@ -2706,6 +2753,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                 device=self.device,
             )
 
+        elif self.particle_self_contact_comoving_truncation:
+            self._comoving_truncation(particle_q_out)
         else:
             ##  parallel by collision and atomic operation
             self.truncation_ts.fill_(1.0)
@@ -2745,6 +2794,59 @@ class SolverVBD(SolverBase, CouplingInterface):
                 ],
                 device=self.device,
             )
+
+    def _comoving_truncation(self, particle_q_out):
+        """Planar truncation of each particle's move relative to its cluster's shared move (see
+        ``particle_self_contact_comoving_truncation``). Cluster mass, held flags and smallest caps come from
+        ``_comoving_update_clusters``; only the displacement sums change between calls."""
+        model = self.model
+        count = model.particle_count
+        max_displacement = self._self_contact_query_radius * self.particle_conservative_bound_relaxation * 0.5
+        caps = self.particle_speculative_caps
+        move_limit = max_displacement if caps is None else 1.0e30
+        block = _COMOVING_BLOCK if self.device.is_cuda else 1  # Warp runs CPU tiles one thread per block
+        self._comoving_momentum.zero_()
+        wp.launch_tiled(
+            comoving_accumulate_cluster_momentum,
+            dim=[(count + block - 1) // block],
+            inputs=[self.particle_displacements, model.particle_inv_mass, model.particle_flags, self.particle_group,
+                    self._comoving_labels, count],
+            outputs=[self._comoving_momentum],
+            block_dim=block,
+            device=self.device,
+        )
+        clusters = [self._comoving_mass, self._comoving_momentum, self._comoving_held, self._comoving_cap, move_limit]
+        wp.launch(
+            comoving_relative_displacements,
+            dim=count,
+            inputs=[self.particle_displacements, self.particle_group, self._comoving_labels, *clusters],
+            outputs=[self._comoving_relative],
+            device=self.device,
+        )
+        self.truncation_ts.fill_(1.0)
+        wp.launch(
+            kernel=apply_planar_truncation_parallel_by_collision,
+            inputs=[
+                self.pos_prev_collision_detection,
+                self._comoving_relative,
+                model.tri_indices,
+                model.edge_indices,
+                self.trimesh_collision_info,
+                self._self_contact_edge_edge_parallel_epsilon,
+                self.particle_conservative_bound_relaxation,
+            ],
+            outputs=[self.truncation_ts],
+            dim=self.particle_self_contact_evaluation_kernel_launch_size,
+            device=self.device,
+        )
+        wp.launch(
+            comoving_apply_truncation_ts,
+            dim=count,
+            inputs=[self.pos_prev_collision_detection, self._comoving_relative, self.truncation_ts,
+                    self.particle_group, self._comoving_labels, *clusters, max_displacement, caps],
+            outputs=[self.particle_displacements, particle_q_out],
+            device=self.device,
+        )
 
     def _initialize_particles(self, state_in: State, state_out: State, dt: float, contacts: Contacts | None = None):
         """Initialize particle positions for the VBD iteration."""
@@ -4173,6 +4275,53 @@ class SolverVBD(SolverBase, CouplingInterface):
         return mode, freq
 
     def _collision_detection_penetration_free(self, current_state: State):
+        self._detect_self_contact(current_state)
+        if self.particle_self_contact_comoving_truncation:
+            self._comoving_update_clusters()
+
+    def _comoving_update_clusters(self):
+        """Cluster labels per group: connected bodies joined through this detection's pairs."""
+        model = self.model
+        labels = self._comoving_labels
+        count = self._comoving_group_count
+        wp.launch(comoving_reset_cluster_labels, dim=count, outputs=[labels], device=self.device)
+        for _ in range(count - 1):  # a chain of n groups needs at most n - 1 joins (none for one group)
+            if model.tri_count:
+                wp.launch(
+                    comoving_join_vertex_triangle_clusters,
+                    dim=model.particle_count,
+                    inputs=[self.trimesh_collision_info, model.tri_indices, self.particle_group],
+                    outputs=[labels],
+                    device=self.device,
+                )
+            if model.edge_count:
+                wp.launch(
+                    comoving_join_edge_edge_clusters,
+                    dim=model.edge_count,
+                    inputs=[self.trimesh_collision_info, model.edge_indices, self.particle_group],
+                    outputs=[labels],
+                    device=self.device,
+                )
+            wp.launch(comoving_compress_cluster_labels, dim=count, outputs=[labels], device=self.device)
+        self._comoving_cluster_properties()
+
+    def _comoving_cluster_properties(self):
+        """Per detection: cluster mass, held flags and smallest caps (fixed until the next detection)."""
+        caps = self.particle_speculative_caps
+        max_displacement = self._self_contact_query_radius * self.particle_conservative_bound_relaxation * 0.5
+        self._comoving_mass.zero_()
+        self._comoving_held.zero_()
+        self._comoving_cap.fill_(max_displacement if caps is None else 1.0e30)
+        wp.launch(
+            comoving_cluster_properties,
+            dim=self.model.particle_count,
+            inputs=[self.model.particle_inv_mass, self.model.particle_flags, self.particle_group,
+                    self._comoving_labels, caps],
+            outputs=[self._comoving_mass, self._comoving_held, self._comoving_cap],
+            device=self.device,
+        )
+
+    def _detect_self_contact(self, current_state: State):
         # particle_displacements is based on pos_prev_collision_detection
         # so reset them every time we do collision detection
         self.pos_prev_collision_detection.assign(current_state.particle_q)
@@ -4182,6 +4331,39 @@ class SolverVBD(SolverBase, CouplingInterface):
             self.collision_pipeline._detect_soft_self_contact(current_state.particle_q, self._pipeline_contacts)
         elif self.particle_self_contact_speculative:
             relaxation = self.particle_conservative_bound_relaxation
+            group_speed = None
+            if self.particle_self_contact_comoving_truncation:
+                # Caps follow each body's mean speed too, so the move a cluster shares is not capped by its slowest
+                # particle; detection below reaches as far as these caps, so the guarantee is unchanged.
+                group_speed = self._comoving_group_speed
+                self._comoving_mass.zero_()
+                self._comoving_momentum.zero_()
+                wp.launch(
+                    accumulate_group_momentum,
+                    dim=self.model.particle_count,
+                    inputs=[current_state.particle_qd, self.model.particle_inv_mass, self.model.particle_flags,
+                            self.particle_group],
+                    outputs=[self._comoving_mass, self._comoving_momentum],
+                    device=self.device,
+                )
+                # Clusters are found by this detection; the previous step's labels say which bodies move together.
+                self._comoving_cap.zero_()  # scratch: cluster mass
+                self._comoving_move.zero_()  # scratch: cluster momentum
+                wp.launch(
+                    accumulate_cluster_momentum,
+                    dim=self._comoving_group_count,
+                    inputs=[self._comoving_mass, self._comoving_momentum, self._comoving_labels],
+                    outputs=[self._comoving_cap, self._comoving_move],
+                    device=self.device,
+                )
+                wp.launch(
+                    group_mean_speed,
+                    dim=self._comoving_group_count,
+                    inputs=[self._comoving_mass, self._comoving_momentum, self._comoving_labels, self._comoving_cap,
+                            self._comoving_move],
+                    outputs=[group_speed],
+                    device=self.device,
+                )
             wp.launch(
                 kernel=compute_speculative_particle_caps,
                 dim=self.model.particle_count,
@@ -4192,6 +4374,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self._particle_step_dt,
                     self._self_contact_query_radius * relaxation * 0.5,
                     _SPECULATIVE_CAP_FACTOR,
+                    self.particle_group if group_speed is not None else None,
+                    group_speed,
                 ],
                 outputs=[self.particle_speculative_caps],
                 device=self.device,
