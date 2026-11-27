@@ -154,10 +154,17 @@ def assemble_tet_vertex_force_and_hessian(
 
 
 @wp.func
+def metric_change(fa: wp.vec3, fb: wp.vec3, da: wp.vec3, db: wp.vec3):
+    """``fa.fb - (fa - da).(fb - db)``: the change of a metric entry over a step from the columns' changes, written as
+    ``da.(fb - db) + fa.db`` so its rounding error scales with the change, not with the metric."""
+    return wp.dot(da, fb - db) + wp.dot(fa, db)
+
+
+@wp.func
 def evaluate_volumetric_neo_hookean_force_and_hessian(
     tet_id: int,
     v_order: int,
-    pos_prev: wp.array[wp.vec3],
+    pos_move: wp.array[wp.vec3],
     pos: wp.array[wp.vec3],
     tet_indices: wp.array2d[wp.int32],
     Dm_inv: wp.mat33,
@@ -250,27 +257,30 @@ def evaluate_volumetric_neo_hookean_force_and_hessian(
     if damping > 0.0:
         inv_dt = 1.0 / dt
 
-        v0_prev = pos_prev[tet_indices[tet_id, 0]]
-        v1_prev = pos_prev[tet_indices[tet_id, 1]]
-        v2_prev = pos_prev[tet_indices[tet_id, 2]]
-        v3_prev = pos_prev[tet_indices[tet_id, 3]]
-
-        Ds_prev = wp.matrix_from_cols(v1_prev - v0_prev, v2_prev - v0_prev, v3_prev - v0_prev)
-        F_prev = Ds_prev * Dm_inv
+        # F's change over the step from the vertices' exact moves (pos_move), not from previous positions: their
+        # difference would round to the float32 spacing of the absolute positions.
+        m0 = pos_move[tet_indices[tet_id, 0]]
+        dDs = wp.matrix_from_cols(
+            pos_move[tet_indices[tet_id, 1]] - m0,
+            pos_move[tet_indices[tet_id, 2]] - m0,
+            pos_move[tet_indices[tet_id, 3]] - m0,
+        )
+        dF = dDs * Dm_inv
 
         f0 = wp.vec3(F[0, 0], F[1, 0], F[2, 0])
         f1 = wp.vec3(F[0, 1], F[1, 1], F[2, 1])
         f2 = wp.vec3(F[0, 2], F[1, 2], F[2, 2])
-        f0_prev = wp.vec3(F_prev[0, 0], F_prev[1, 0], F_prev[2, 0])
-        f1_prev = wp.vec3(F_prev[0, 1], F_prev[1, 1], F_prev[2, 1])
-        f2_prev = wp.vec3(F_prev[0, 2], F_prev[1, 2], F_prev[2, 2])
+        d0 = wp.vec3(dF[0, 0], dF[1, 0], dF[2, 0])
+        d1 = wp.vec3(dF[0, 1], dF[1, 1], dF[2, 1])
+        d2 = wp.vec3(dF[0, 2], dF[1, 2], dF[2, 2])
 
-        c00_rate = (wp.dot(f0, f0) - wp.dot(f0_prev, f0_prev)) * inv_dt
-        c01_rate = (wp.dot(f0, f1) - wp.dot(f0_prev, f1_prev)) * inv_dt
-        c02_rate = (wp.dot(f0, f2) - wp.dot(f0_prev, f2_prev)) * inv_dt
-        c11_rate = (wp.dot(f1, f1) - wp.dot(f1_prev, f1_prev)) * inv_dt
-        c12_rate = (wp.dot(f1, f2) - wp.dot(f1_prev, f2_prev)) * inv_dt
-        c22_rate = (wp.dot(f2, f2) - wp.dot(f2_prev, f2_prev)) * inv_dt
+        # C = F^T F; C - C_prev with F_prev = F - dF, expanded so no two O(1) terms cancel
+        c00_rate = metric_change(f0, f0, d0, d0) * inv_dt
+        c01_rate = metric_change(f0, f1, d0, d1) * inv_dt
+        c02_rate = metric_change(f0, f2, d0, d2) * inv_dt
+        c11_rate = metric_change(f1, f1, d1, d1) * inv_dt
+        c12_rate = metric_change(f1, f2, d1, d2) * inv_dt
+        c22_rate = metric_change(f2, f2, d2, d2) * inv_dt
 
         dc00_dx = 2.0 * m[0] * f0
         dc01_dx = m[0] * f1 + m[1] * f0
@@ -512,7 +522,7 @@ def evaluate_neo_hookean_membrane_force_hessian(
     face: int,
     v_order: int,
     pos: wp.array[wp.vec3],
-    pos_anchor: wp.array[wp.vec3],
+    pos_move: wp.array[wp.vec3],
     tri_indices: wp.array2d[wp.int32],
     tri_pose: wp.mat22,
     area: float,
@@ -609,16 +619,16 @@ def evaluate_neo_hookean_membrane_force_hessian(
     if damping > 0.0:
         inv_dt = 1.0 / dt
 
-        x0_prev = pos_anchor[v0]
-        x01_prev = pos_anchor[v1] - x0_prev
-        x02_prev = pos_anchor[v2] - x0_prev
+        # F's change over the step from the vertices' exact moves (see the volumetric damping)
+        m0 = pos_move[v0]
+        dx01 = pos_move[v1] - m0
+        dx02 = pos_move[v2] - m0
+        d0 = dx01 * DmInv00 + dx02 * DmInv10
+        d1 = dx01 * DmInv01 + dx02 * DmInv11
 
-        f0_prev = x01_prev * DmInv00 + x02_prev * DmInv10
-        f1_prev = x01_prev * DmInv01 + x02_prev * DmInv11
-
-        c00_rate = (f0_dot_f0 - wp.dot(f0_prev, f0_prev)) * inv_dt
-        c01_rate = (f0_dot_f1 - wp.dot(f0_prev, f1_prev)) * inv_dt
-        c11_rate = (f1_dot_f1 - wp.dot(f1_prev, f1_prev)) * inv_dt
+        c00_rate = metric_change(f0, f0, d0, d0) * inv_dt
+        c01_rate = metric_change(f0, f1, d0, d1) * inv_dt
+        c11_rate = metric_change(f1, f1, d1, d1) * inv_dt
 
         dc00_dx = 2.0 * df0_dx * f0
         dc01_dx = df0_dx * f1 + df1_dx * f0
@@ -674,7 +684,7 @@ def evaluate_dihedral_angle_based_bending_force_hessian(
     bending_index: int,
     v_order: int,
     pos: wp.array[wp.vec3],
-    pos_anchor: wp.array[wp.vec3],
+    pos_move: wp.array[wp.vec3],
     edge_indices: wp.array2d[wp.int32],
     edge_rest_angle: wp.array[float],
     edge_rest_length: wp.array[float],
@@ -779,16 +789,17 @@ def evaluate_dihedral_angle_based_bending_force_hessian(
 
     if damping > 0.0:
         inv_dt = 1.0 / dt
-        x_prev0 = pos_anchor[vi0]
-        x_prev1 = pos_anchor[vi1]
-        x_prev2 = pos_anchor[vi2]
-        x_prev3 = pos_anchor[vi3]
+        # previous edge vectors from the vertices' exact moves (see the volumetric damping)
+        m0 = pos_move[vi0]
+        m1 = pos_move[vi1]
+        m2 = pos_move[vi2]
+        m3 = pos_move[vi3]
 
-        x02_prev = x_prev2 - x_prev0
-        x03_prev = x_prev3 - x_prev0
-        x13_prev = x_prev3 - x_prev1
-        x12_prev = x_prev2 - x_prev1
-        e_prev = x_prev3 - x_prev2
+        x02_prev = x02 - (m2 - m0)
+        x03_prev = x03 - (m3 - m0)
+        x13_prev = x13 - (m3 - m1)
+        x12_prev = x12 - (m2 - m1)
+        e_prev = e - (m3 - m2)
 
         n1_prev_raw = wp.cross(x02_prev, x03_prev)
         n2_prev_raw = wp.cross(x13_prev, x12_prev)
@@ -1382,6 +1393,19 @@ def reset_particle_state(
         particle_qd[tid] = model_particle_qd[tid]
 
 
+@wp.func
+def step_displacement(
+    i: int,
+    pos_prev: wp.array[wp.vec3],
+    pos_base: wp.array[wp.vec3],
+    displacements: wp.array[wp.vec3],
+):
+    """A particle's exact move since the step start ``pos_prev``: the collision-detection base's offset (a difference
+    of two nearby floats, exact) plus the displacement accumulated on that base. Unlike ``pos - pos_prev`` it keeps
+    moves smaller than the float32 spacing of the absolute position."""
+    return (pos_base[i] - pos_prev[i]) + displacements[i]
+
+
 @wp.kernel
 def forward_step(
     dt: float,
@@ -1396,10 +1420,18 @@ def forward_step(
     vel_prev_step: wp.array[wp.vec3],
     particle_group: wp.array[wp.int32],
     group_held: wp.array[wp.int32],
+    residual: wp.array[wp.vec3],
+    residual_owner: wp.array[wp.vec3],
     inertia_out: wp.array[wp.vec3],
     displacements_out: wp.array[wp.vec3],
 ):
     """Compute the inertial target and the initial guess of one VBD step.
+
+    Both are written relative to the step's start position ``pos`` (``inertia_out`` is the inertial target minus
+    ``pos``), so the solve's inertia term never subtracts two absolute positions. ``residual`` is the part of each
+    particle's exact position that ``pos`` could not hold (compensated positions, see ``finalize_particle_step``); it
+    is used only while ``pos`` still equals ``residual_owner`` (the position it was computed for), is folded into the
+    target and the guess, and is replaced here by the value used, which ``finalize_particle_step`` reads.
 
     The initial guess is ``pos + displacements_out``. Without ``vel_prev_step`` it is the
     inertial target ``pos + (vel + a dt) dt``. With ``vel_prev_step`` (the particle velocities
@@ -1420,18 +1452,22 @@ def forward_step(
 
     pos_prev[particle] = pos[particle]
     if not particle_flags[particle] & ParticleFlags.ACTIVE or inv_mass[particle] == 0:
-        inertia_out[particle] = pos_prev[particle]
+        inertia_out[particle] = wp.vec3(0.0, 0.0, 0.0)
         if displacements_out:
             displacements_out[particle] = wp.vec3(0.0, 0.0, 0.0)
         if vel_prev_step:
             vel_prev_step[particle] = vel[particle]
+        residual[particle] = wp.vec3(0.0, 0.0, 0.0)
         return
+    r = wp.vec3(0.0, 0.0, 0.0)
+    if residual_owner[particle] == pos[particle]:
+        r = residual[particle]
+    residual[particle] = r
     world_idx = particle_world[particle]
     world_g = gravity[world_idx]
     acceleration = world_g + external_force[particle] * inv_mass[particle]
     vel_new = vel[particle] + acceleration * dt
-    inertia = pos[particle] + vel_new * dt
-    inertia_out[particle] = inertia
+    inertia_out[particle] = r + vel_new * dt
     if displacements_out:
         if vel_prev_step:
             scale = float(1.0)
@@ -1442,9 +1478,9 @@ def forward_step(
             if acceleration_sq > 0.0 and not free:
                 observed = (vel[particle] - vel_prev_step[particle]) / dt
                 scale = wp.clamp(wp.dot(observed, acceleration) / acceleration_sq, 0.0, 1.0)
-            displacements_out[particle] = (vel[particle] + acceleration * (scale * dt)) * dt
+            displacements_out[particle] = r + (vel[particle] + acceleration * (scale * dt)) * dt
         else:
-            displacements_out[particle] = vel_new * dt
+            displacements_out[particle] = r + vel_new * dt
     if vel_prev_step:
         vel_prev_step[particle] = vel[particle]
 
@@ -1505,6 +1541,9 @@ def rigid_mode_accumulate_system(
     dt: float,
     pos: wp.array[wp.vec3],
     inertia: wp.array[wp.vec3],
+    pos_prev: wp.array[wp.vec3],
+    pos_base: wp.array[wp.vec3],
+    displacements: wp.array[wp.vec3],
     particle_mass: wp.array[float],
     inv_mass: wp.array[float],
     particle_flags: wp.array[wp.int32],
@@ -1530,7 +1569,7 @@ def rigid_mode_accumulate_system(
     m = particle_mass[i]
     r = pos[i] - group_moment[g] / total
     k = wp.identity(3, float) * (m / (dt * dt)) + hessians[i]
-    res = m * (pos[i] - inertia[i]) / (dt * dt) - forces[i]
+    res = m * (step_displacement(i, pos_prev, pos_base, displacements) - inertia[i]) / (dt * dt) - forces[i]
     s = _skew(r)
     b = -(k * s)  # K J_w, with J_w = -[r]x
     d = wp.transpose(s) * k * s  # J_w^T K J_w
@@ -1860,6 +1899,73 @@ def apply_conservative_bound_truncation(
 def update_velocity(dt: float, pos_prev: wp.array[wp.vec3], pos: wp.array[wp.vec3], vel: wp.array[wp.vec3]):
     particle = wp.tid()
     vel[particle] = (pos[particle] - pos_prev[particle]) / dt
+
+
+@wp.func
+def _float32_spacing(x: wp.vec3):
+    """An upper bound on the float32 spacing of the largest component of ``x``."""
+    return wp.max(wp.max(wp.abs(x[0]), wp.abs(x[1])), wp.abs(x[2])) * 2.4e-7 + 1.0e-30
+
+
+@wp.kernel
+def finalize_particle_step(
+    dt: float,
+    pos_prev: wp.array[wp.vec3],
+    pos_base: wp.array[wp.vec3],
+    displacements: wp.array[wp.vec3],
+    pos: wp.array[wp.vec3],
+    vel: wp.array[wp.vec3],
+    residual: wp.array[wp.vec3],
+    residual_owner: wp.array[wp.vec3],
+):
+    """Velocities from each particle's exact move, and the residual its stored position could not hold.
+
+    Compensated positions: a particle's position is ``pos + residual``. Velocity is the exact move over the step
+    (``step_displacement`` less the residual it started from) instead of ``pos - pos_prev``, which rounds to the float32
+    spacing of the absolute position (0.12 um at 1-2 m, so 0.35 mm/s at a 1/2880 s substep): a slow particle far from
+    the origin would read as still and stay still. ``residual`` (at most half a spacing) is carried into the next step by
+    ``forward_step`` while the position is unchanged. A particle moved outside the displacement this step (its stored
+    position disagrees with the exact move by more than a spacing) falls back to ``pos - pos_prev`` and no residual.
+    """
+    i = wp.tid()
+    rounded = pos[i] - pos_prev[i]  # exact: two nearby floats
+    move = step_displacement(i, pos_prev, pos_base, displacements)
+    carried = residual[i]
+    r = move - rounded
+    if wp.length(r) > 2.0 * _float32_spacing(pos[i]):
+        vel[i] = rounded / dt
+        residual[i] = wp.vec3(0.0)
+    else:
+        vel[i] = (move - carried) / dt
+        residual[i] = r
+    residual_owner[i] = pos[i]
+
+
+@wp.kernel
+def update_step_moves(
+    pos_prev: wp.array[wp.vec3],
+    pos_base: wp.array[wp.vec3],
+    displacements: wp.array[wp.vec3],
+    residual: wp.array[wp.vec3],
+    pos_move: wp.array[wp.vec3],
+):
+    """Each particle's exact move since the step start (``step_displacement`` less the residual the step started
+    from): the rate the damping terms use."""
+    i = wp.tid()
+    pos_move[i] = step_displacement(i, pos_prev, pos_base, displacements) - residual[i]
+
+
+@wp.kernel
+def rebase_displacements(
+    pos: wp.array[wp.vec3],
+    pos_base: wp.array[wp.vec3],
+    displacements: wp.array[wp.vec3],
+):
+    """Move the displacement base to the current positions, keeping the part of each displacement the rounded position
+    does not hold (so a re-detection mid-step loses nothing)."""
+    i = wp.tid()
+    displacements[i] = displacements[i] - (pos[i] - pos_base[i])
+    pos_base[i] = pos[i]
 
 
 @wp.kernel
@@ -3035,6 +3141,8 @@ def solve_elasticity_tile(
     pos: wp.array[wp.vec3],
     mass: wp.array[float],
     inertia: wp.array[wp.vec3],
+    pos_base: wp.array[wp.vec3],
+    pos_move: wp.array[wp.vec3],
     particle_flags: wp.array[wp.int32],
     tri_indices: wp.array2d[wp.int32],
     tri_poses: wp.array[wp.mat22],
@@ -3103,7 +3211,7 @@ def solve_elasticity_tile(
                     tri_index,
                     vertex_order,
                     pos,
-                    pos_prev,
+                    pos_move,
                     tri_indices,
                     tri_poses[tri_index],
                     tri_areas[tri_index],
@@ -3130,7 +3238,7 @@ def solve_elasticity_tile(
                     nei_edge_index,
                     vertex_order_on_edge,
                     pos,
-                    pos_prev,
+                    pos_move,
                     edge_indices,
                     edge_rest_angles,
                     edge_rest_length,
@@ -3156,7 +3264,7 @@ def solve_elasticity_tile(
                 f_tet, h_tet = evaluate_volumetric_neo_hookean_force_and_hessian(
                     nei_tet_index,
                     vertex_order_on_tet,
-                    pos_prev,
+                    pos_move,
                     pos,
                     tet_indices,
                     tet_poses[nei_tet_index],
@@ -3185,7 +3293,9 @@ def solve_elasticity_tile(
             h_inv = wp.inverse(h_total)
             f_total = (
                 f_total
-                + mass[particle_index] * (inertia[particle_index] - pos[particle_index]) * (dt_sqr_reciprocal)
+                + mass[particle_index]
+                * (inertia[particle_index] - step_displacement(particle_index, pos_prev, pos_base, particle_displacements))
+                * (dt_sqr_reciprocal)
                 + particle_forces[particle_index]
             )
             particle_displacements[particle_index] = particle_displacements[particle_index] + h_inv * f_total
@@ -3199,6 +3309,8 @@ def solve_elasticity(
     pos: wp.array[wp.vec3],
     mass: wp.array[float],
     inertia: wp.array[wp.vec3],
+    pos_base: wp.array[wp.vec3],
+    pos_move: wp.array[wp.vec3],
     particle_flags: wp.array[wp.int32],
     tri_indices: wp.array2d[wp.int32],
     tri_poses: wp.array[wp.mat22],
@@ -3228,7 +3340,11 @@ def solve_elasticity(
     dt_sqr_reciprocal = 1.0 / (dt * dt)
 
     # inertia force and hessian
-    f = mass[particle_index] * (inertia[particle_index] - pos[particle_index]) * (dt_sqr_reciprocal)
+    f = (
+        mass[particle_index]
+        * (inertia[particle_index] - step_displacement(particle_index, pos_prev, pos_base, particle_displacements))
+        * dt_sqr_reciprocal
+    )
     h = mass[particle_index] * dt_sqr_reciprocal * wp.identity(n=3, dtype=float)
 
     # fmt: off
@@ -3265,7 +3381,7 @@ def solve_elasticity(
                     tri_index,
                     vertex_order,
                     pos,
-                    pos_prev,
+                    pos_move,
                     tri_indices,
                     tri_poses[tri_index],
                     tri_areas[tri_index],
@@ -3284,7 +3400,7 @@ def solve_elasticity(
             # vertex is on the edge; otherwise it only effects the bending energy n
             if edge_bending_properties[nei_edge_index, 0] > 0.0:
                 f_edge, h_edge = evaluate_dihedral_angle_based_bending_force_hessian(
-                    nei_edge_index, vertex_order_on_edge, pos, pos_prev, edge_indices, edge_rest_angles, edge_rest_length,
+                    nei_edge_index, vertex_order_on_edge, pos, pos_move, edge_indices, edge_rest_angles, edge_rest_length,
                     edge_bending_properties[nei_edge_index, 0], edge_bending_properties[nei_edge_index, 1], dt
                 )
 
@@ -3302,7 +3418,7 @@ def solve_elasticity(
                 f_tet, h_tet = evaluate_volumetric_neo_hookean_force_and_hessian(
                     nei_tet_index,
                     vertex_order_on_tet,
-                    pos_prev,
+                    pos_move,
                     pos,
                     tet_indices,
                     tet_poses[nei_tet_index],

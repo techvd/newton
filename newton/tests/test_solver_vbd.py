@@ -508,7 +508,7 @@ def _eval_spring_damping_kernel(
 @wp.kernel
 def _eval_bending_degenerate_anchor_kernel(
     pos: wp.array[wp.vec3],
-    pos_anchor: wp.array[wp.vec3],
+    pos_move: wp.array[wp.vec3],
     edge_indices: wp.array2d[wp.int32],
     edge_rest_angle: wp.array[float],
     edge_rest_length: wp.array[float],
@@ -519,7 +519,7 @@ def _eval_bending_degenerate_anchor_kernel(
         0,
         v_order,
         pos,
-        pos_anchor,
+        pos_move,
         edge_indices,
         edge_rest_angle,
         edge_rest_length,
@@ -534,6 +534,7 @@ def _eval_bending_degenerate_anchor_kernel(
 def _eval_elastic_damping_rigid_motion_kernel(
     pos: wp.array[wp.vec3],
     pos_anchor: wp.array[wp.vec3],
+    pos_move: wp.array[wp.vec3],
     spring_indices: wp.array[int],
     spring_rest_length: wp.array[float],
     spring_stiffness: wp.array[float],
@@ -570,7 +571,7 @@ def _eval_elastic_damping_rigid_motion_kernel(
             sample,
             v_order,
             pos,
-            pos_anchor,
+            pos_move,
             tri_indices,
             tri_poses[sample],
             tri_areas[sample],
@@ -588,7 +589,7 @@ def _eval_elastic_damping_rigid_motion_kernel(
             sample,
             v_order,
             pos,
-            pos_anchor,
+            pos_move,
             edge_indices,
             edge_rest_angle,
             edge_rest_length,
@@ -604,7 +605,7 @@ def _eval_elastic_damping_rigid_motion_kernel(
         tet_force, _tet_hessian = evaluate_volumetric_neo_hookean_force_and_hessian(
             sample,
             v_order,
-            pos_anchor,
+            pos_move,
             pos,
             tet_indices,
             tet_poses[sample],
@@ -1981,7 +1982,7 @@ def _bending_damping_handles_degenerate_anchor(test, device):
             dtype=wp.vec3,
             device=device,
         )
-        pos_anchor = wp.zeros(4, dtype=wp.vec3, device=device)
+        pos_move = pos  # every vertex moved from the origin: the previous geometry is collapsed
         edge_indices = wp.array([[0, 1, 2, 3]], dtype=wp.int32, ndim=2, device=device)
         edge_rest_angle = wp.array([0.0], dtype=float, device=device)
         edge_rest_length = wp.array([1.0], dtype=float, device=device)
@@ -1990,7 +1991,7 @@ def _bending_damping_handles_degenerate_anchor(test, device):
         wp.launch(
             _eval_bending_degenerate_anchor_kernel,
             dim=4,
-            inputs=[pos, pos_anchor, edge_indices, edge_rest_angle, edge_rest_length],
+            inputs=[pos, pos_move, edge_indices, edge_rest_angle, edge_rest_length],
             outputs=[force_norms],
             device=device,
         )
@@ -2009,6 +2010,7 @@ def _elastic_damping_ignores_rigid_motion(test, device):
     with wp.ScopedDevice(device):
         pos = wp.array(data["pos"], dtype=wp.vec3, device=device)
         pos_anchor = wp.array(data["pos_anchor"], dtype=wp.vec3, device=device)
+        pos_move = wp.array(np.asarray(data["pos"]) - np.asarray(data["pos_anchor"]), dtype=wp.vec3, device=device)
         spring_indices = wp.array(data["spring_indices"], dtype=int, device=device)
         spring_rest_length = wp.array(data["spring_rest_length"], dtype=float, device=device)
         spring_stiffness = wp.array(data["spring_stiffness"], dtype=float, device=device)
@@ -2029,6 +2031,7 @@ def _elastic_damping_ignores_rigid_motion(test, device):
             inputs=[
                 pos,
                 pos_anchor,
+                pos_move,
                 spring_indices,
                 spring_rest_length,
                 spring_stiffness,
@@ -2048,11 +2051,14 @@ def _elastic_damping_ignores_rigid_motion(test, device):
 
         max_norms = force_norms.numpy().max(axis=0)
 
+    # Membrane, bending and tet damping take the step's change from the vertices' moves (float32 error relative to
+    # the move); these moves are whole rotations of a 1.3 m tet plus up to 1 m in one 0.1 s step, so about 2.4e-7 m,
+    # times damping / dt = 200, sits at a few 1e-4 N (the spring, from positions, is at 5e-5).
     np.testing.assert_allclose(
         max_norms,
         np.zeros(4),
         rtol=0.0,
-        atol=1.0e-4,
+        atol=4.0e-4,
         err_msg="Expected zero damping force for spring, membrane, bending, and tet rigid motions",
     )
 
@@ -4962,3 +4968,58 @@ add_function_test(TestSolverVBD, "test_particle_static_friction", _particle_stat
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, failfast=True)
+
+
+def _hanging_strip(device, top: float):
+    """A 1 x 0.05 m cloth strip (64 x 2 cells, 150 g/m^2, 1 kN/m membrane) hanging from y = ``top``."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, -9.81, 0.0))
+    builder.add_cloth_grid(
+        pos=wp.vec3(0.0, top, 0.0),
+        rot=wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), -0.5 * wp.pi),
+        vel=wp.vec3(0.0, 0.0, 0.0),
+        dim_x=64,
+        dim_y=2,
+        cell_x=1.0 / 64,
+        cell_y=0.025,
+        mass=0.15 * (1.0 / 64) * 0.025,
+        fix_left=True,
+        tri_ke=385.0,
+        tri_ka=330.0,
+        tri_kd=1.0,
+        edge_ke=1.0e-4,
+    )
+    builder.color(include_bending=True)
+    return builder.finalize(device=device)
+
+
+def _particle_compensated_positions(test, device):
+    """Moves smaller than the float32 spacing of the absolute position are kept (compensated positions).
+
+    A particle at y = 100 m (spacing 7.6 um) drifting at 1 mm/s with 1 ms steps moves 1 um per step: rounded to the
+    stored position, every move would be lost and the velocity read back as zero. And a stiff cloth strip at fine
+    substeps solves per-step moves of a few hundredths of a micrometre on its first steps; rounded, it never starts to
+    stretch from y = 2 m (spacing 0.12-0.24 um) while it does from y = 0.5 m. Both now behave the same at any height.
+    """
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, 0.0, 0.0))
+    builder.add_particle(pos=wp.vec3(0.0, 100.0, 0.0), vel=wp.vec3(0.0, 1.0e-3, 0.0), mass=1.0, radius=0.01)
+    builder.color()
+    drifter = builder.finalize(device=device)
+    solver = newton.solvers.SolverVBD(drifter, iterations=2)
+    moved = float(_run_particles(drifter, solver, steps=500, dt=1.0e-3)[0, 1]) - 100.0
+    test.assertAlmostEqual(moved, 0.5e-3, delta=2.0e-5)
+
+    dt = 1.0 / 2880.0
+    elongation = []
+    for top in (0.5, 2.0):
+        strip = _hanging_strip(device, top)
+        bottom = np.isclose(strip.particle_q.numpy()[:, 1], top - 1.0, atol=1.0e-4)
+        solver = newton.solvers.SolverVBD(strip, iterations=20, particle_initial_guess="adaptive")
+        q = _run_particles(strip, solver, steps=720, dt=dt)
+        elongation.append(float(top - 1.0 - q[bottom, 1].mean()))
+    test.assertGreater(elongation[0], 2.0e-4)
+    test.assertAlmostEqual(elongation[1], elongation[0], delta=0.05 * elongation[0])
+
+
+add_function_test(
+    TestSolverVBD, "test_particle_compensated_positions", _particle_compensated_positions, devices=devices
+)

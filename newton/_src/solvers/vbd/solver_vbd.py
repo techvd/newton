@@ -62,7 +62,10 @@ from .particle_vbd_kernels import (
     rigid_mode_apply,
     rigid_mode_mark_coupled,
     rigid_mode_solve,
+    rebase_displacements,
+    update_step_moves,
     # Solver kernels (particle VBD)
+    finalize_particle_step,
     forward_step,
     mark_held_contact_groups,
     mark_held_particle_groups,
@@ -70,7 +73,6 @@ from .particle_vbd_kernels import (
     reset_particle_state,
     solve_elasticity,
     solve_elasticity_tile,
-    update_velocity,
 )
 from .rigid_vbd_kernels import (
     friction_anchor_begin,
@@ -1041,7 +1043,14 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.particle_q_prev = wp.zeros_like(
             model.particle_q, device=self.device
         )  # per-substep previous q (for velocity)
-        self.inertia = wp.zeros_like(model.particle_q, device=self.device)  # inertial target positions
+        # inertial target relative to particle_q_prev (see forward_step)
+        self.inertia = wp.zeros_like(model.particle_q, device=self.device)
+        # Compensated positions: the part of each exact position particle_q cannot hold, and the particle_q it belongs
+        # to (finalize_particle_step).
+        self.particle_q_residual = wp.zeros_like(model.particle_q, device=self.device)
+        self.particle_q_residual_owner = wp.zeros_like(model.particle_q, device=self.device)
+        # each particle's exact move since the step start, for the damping rates (update_step_moves)
+        self.particle_step_move = wp.zeros_like(model.particle_q, device=self.device)
 
         # Particle adjacency info: reuse the shared device copy built once at finalize (the VBD
         # solver and the collision pipeline both use it, so it is uploaded only once).
@@ -2755,9 +2764,20 @@ class SolverVBD(SolverBase, CouplingInterface):
 
     def _penetration_free_truncation(self, particle_q_out=None):
         """
-        Modify displacements_in in-place, also modify particle_q if its not None
+        Modify displacements_in in-place, also modify particle_q if its not None, and refresh the exact step moves.
 
         """
+        self._truncate_displacements(particle_q_out)
+        wp.launch(
+            kernel=update_step_moves,
+            dim=self.model.particle_count,
+            inputs=[self.particle_q_prev, self.pos_prev_collision_detection, self.particle_displacements,
+                    self.particle_q_residual],
+            outputs=[self.particle_step_move],
+            device=self.device,
+        )
+
+    def _truncate_displacements(self, particle_q_out=None):
         if not self.particle_enable_self_contact:
             self.truncation_ts.fill_(1.0)
             wp.launch(
@@ -2882,7 +2902,7 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         # Collision detection before initialization to compute conservative bounds
         if self.particle_enable_self_contact and self._sc_mode_this_step != SolverBase.CollisionFrequencyType.NONE:
-            self._collision_detection_penetration_free(state_in)
+            self._collision_detection_penetration_free(state_in, rebase=False)
         else:
             self.pos_prev_collision_detection.assign(state_in.particle_q)
             self.particle_displacements.zero_()
@@ -2905,6 +2925,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                 self.particle_qd_prev_step,
                 self.particle_group,
                 self.particle_group_held,
+                self.particle_q_residual,
+                self.particle_q_residual_owner,
             ],
             outputs=[
                 self.inertia,
@@ -3466,7 +3488,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         wp.launch(
             kernel=rigid_mode_accumulate_system,
             dim=model.particle_count,
-            inputs=[dt, state_in.particle_q, self.inertia, model.particle_mass, model.particle_inv_mass,
+            inputs=[dt, state_in.particle_q, self.inertia, self.particle_q_prev, self.pos_prev_collision_detection,
+                    self.particle_displacements, model.particle_mass, model.particle_inv_mass,
                     model.particle_flags, self.particle_group, self.particle_forces, self.particle_hessians,
                     self._rigid_group_mass, self._rigid_group_moment, self._rigid_group_hessian,
                     self._rigid_group_gradient],
@@ -3484,12 +3507,12 @@ class SolverVBD(SolverBase, CouplingInterface):
             dim=model.particle_count,
             inputs=[model.particle_flags, model.particle_inv_mass, self.particle_group, self._rigid_group_mass,
                     self._rigid_group_moment, self._rigid_group_delta, self._rigid_group_coupled, state_in.particle_q,
-                    None, self.particle_displacements if self.particle_enable_self_contact else None],
+                    None, self.particle_displacements],
             device=self.device,
         )
-        if self.particle_enable_self_contact:
-            # Keep the solve penetration-free: the move goes through the same truncation as the iterations' moves.
-            self._penetration_free_truncation(state_in.particle_q)
+        # The move goes through the same truncation as the iterations' moves: penetration-free with self-contact, and
+        # the stored positions rebuilt from the displacement either way (compensated positions).
+        self._penetration_free_truncation(state_in.particle_q)
         if state_out.particle_q.ptr != state_in.particle_q.ptr:
             wp.copy(state_out.particle_q, state_in.particle_q)
 
@@ -3652,6 +3675,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                         state_in.particle_q,
                         self.model.particle_mass,
                         self.inertia,
+                        self.pos_prev_collision_detection,
+                        self.particle_step_move,
                         self.model.particle_flags,
                         self.model.tri_indices,
                         self.model.tri_poses,
@@ -3684,6 +3709,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                         state_in.particle_q,
                         self.model.particle_mass,
                         self.inertia,
+                        self.pos_prev_collision_detection,
+                        self.particle_step_move,
                         self.model.particle_flags,
                         self.model.tri_indices,
                         self.model.tri_poses,
@@ -4188,8 +4215,10 @@ class SolverVBD(SolverBase, CouplingInterface):
             return
 
         wp.launch(
-            kernel=update_velocity,
-            inputs=[dt, self.particle_q_prev, state_out.particle_q, state_out.particle_qd],
+            kernel=finalize_particle_step,
+            inputs=[dt, self.particle_q_prev, self.pos_prev_collision_detection, self.particle_displacements,
+                    state_out.particle_q, state_out.particle_qd, self.particle_q_residual,
+                    self.particle_q_residual_owner],
             dim=self.model.particle_count,
             device=self.device,
         )
@@ -4301,8 +4330,8 @@ class SolverVBD(SolverBase, CouplingInterface):
             freq = interval
         return mode, freq
 
-    def _collision_detection_penetration_free(self, current_state: State):
-        self._detect_self_contact(current_state)
+    def _collision_detection_penetration_free(self, current_state: State, rebase: bool = True):
+        self._detect_self_contact(current_state, rebase)
         if self.particle_self_contact_comoving_truncation:
             self._comoving_update_clusters()
 
@@ -4348,11 +4377,20 @@ class SolverVBD(SolverBase, CouplingInterface):
             device=self.device,
         )
 
-    def _detect_self_contact(self, current_state: State):
-        # particle_displacements is based on pos_prev_collision_detection
-        # so reset them every time we do collision detection
-        self.pos_prev_collision_detection.assign(current_state.particle_q)
-        self.particle_displacements.zero_()
+    def _detect_self_contact(self, current_state: State, rebase: bool = True):
+        # particle_displacements is based on pos_prev_collision_detection, so move the base to the current positions
+        # every time we do collision detection. Mid-step (rebase) the displacement keeps what the rounded positions do
+        # not hold; at the step start forward_step writes the displacement afterwards.
+        if rebase:
+            wp.launch(
+                kernel=rebase_displacements,
+                dim=self.model.particle_count,
+                inputs=[current_state.particle_q, self.pos_prev_collision_detection, self.particle_displacements],
+                device=self.device,
+            )
+        else:
+            self.pos_prev_collision_detection.assign(current_state.particle_q)
+            self.particle_displacements.zero_()
 
         if self.collision_pipeline is not None:
             self.collision_pipeline._detect_soft_self_contact(current_state.particle_q, self._pipeline_contacts)

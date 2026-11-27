@@ -39,6 +39,7 @@ def compute_neo_hookean_energy_and_force_and_hessian(
     tet_id: int,
     dt: float,
     pos: wp.array[wp.vec3],
+    pos_move: wp.array[wp.vec3],
     tet_indices: wp.array2d[wp.int32],
     tet_poses: wp.array[wp.mat33],
     tet_materials: wp.array2d[float],
@@ -50,7 +51,7 @@ def compute_neo_hookean_energy_and_force_and_hessian(
     f, h = evaluate_volumetric_neo_hookean_force_and_hessian(
         tet_id,
         wp.tid(),
-        pos,  # dont need damping
+        pos_move,  # no move, so no damping
         pos,
         tet_indices,
         tet_poses[tet_id],
@@ -494,6 +495,7 @@ def test_tet_energy(test, device):
                 0,
                 dt,
                 state.particle_q,
+                wp.zeros_like(state.particle_q),
                 model.tet_indices,
                 model.tet_poses,
                 model.tet_materials,
