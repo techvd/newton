@@ -27,6 +27,7 @@ from ...geometry import ParticleFlags
 from ...geometry.kernels import triangle_closest_point
 from ...geometry.tri_mesh_collision import (
     TriMeshCollisionInfo,
+    get_edge_colliding_edges,
     get_edge_colliding_edges_count,
     get_vertex_colliding_triangles,
     get_vertex_colliding_triangles_count,
@@ -1642,14 +1643,71 @@ def compute_speculative_particle_caps(
     dt: float,
     base_cap: float,
     factor: float,
+    particle_group: wp.array[wp.int32],
+    group_speed: wp.array[float],
     caps_out: wp.array[float],
 ):
     """Each particle's speculative self-contact cap: how far it may move this step, at least ``base_cap`` and
-    ``factor`` times its free move ``|v| dt + |g| dt^2``."""
+    ``factor`` times its free move ``|v| dt + |g| dt^2``. With ``group_speed`` (co-moving truncation), ``|v|`` is at
+    least its connected body's mean speed, so a momentarily slow particle (a flapping corner) does not cap the move
+    its body shares."""
     i = wp.tid()
     world = particle_world[i]
     g = gravity[wp.max(world, 0)]
-    caps_out[i] = wp.max(base_cap, factor * (wp.length(vel[i]) * dt + wp.length(g) * dt * dt))
+    speed = wp.length(vel[i])
+    if group_speed:
+        speed = wp.max(speed, group_speed[particle_group[i]])
+    caps_out[i] = wp.max(base_cap, factor * (speed * dt + wp.length(g) * dt * dt))
+
+
+@wp.kernel
+def accumulate_group_momentum(
+    vel: wp.array[wp.vec3],
+    inv_mass: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    particle_group: wp.array[wp.int32],
+    group_mass: wp.array[float],
+    group_momentum: wp.array[wp.vec3],
+):
+    i = wp.tid()
+    if not particle_flags[i] & ParticleFlags.ACTIVE or inv_mass[i] == 0.0:
+        return
+    mass = 1.0 / inv_mass[i]
+    wp.atomic_add(group_mass, particle_group[i], mass)
+    wp.atomic_add(group_momentum, particle_group[i], mass * vel[i])
+
+
+@wp.kernel
+def accumulate_cluster_momentum(
+    group_mass: wp.array[float],
+    group_momentum: wp.array[wp.vec3],
+    labels: wp.array[wp.int32],
+    cluster_mass: wp.array[float],
+    cluster_momentum: wp.array[wp.vec3],
+):
+    g = wp.tid()
+    wp.atomic_add(cluster_mass, labels[g], group_mass[g])
+    wp.atomic_add(cluster_momentum, labels[g], group_momentum[g])
+
+
+@wp.kernel
+def group_mean_speed(
+    group_mass: wp.array[float],
+    group_momentum: wp.array[wp.vec3],
+    labels: wp.array[wp.int32],
+    cluster_mass: wp.array[float],
+    cluster_momentum: wp.array[wp.vec3],
+    speed_out: wp.array[float],
+):
+    """A group's cap speed: the larger of its own mean speed and its previous cluster's (bodies moving together)."""
+    g = wp.tid()
+    speed = 0.0
+    if group_mass[g] > 0.0:
+        speed = wp.length(group_momentum[g] / group_mass[g])
+    c = labels[g]
+    if cluster_mass[c] > 0.0:
+        speed = wp.max(speed, wp.length(cluster_momentum[c] / cluster_mass[c]))
+    speed_out[g] = speed
 
 
 @wp.kernel
@@ -2625,6 +2683,201 @@ def apply_truncation_ts(
     displacement_out[i] = particle_displacement
     if pos_out:
         pos_out[i] = pos[i] + particle_displacement
+
+
+# Co-moving truncation (``particle_self_contact_comoving_truncation``): the planar truncation runs on each particle's
+# displacement relative to its cluster's mean displacement, and every particle of a cluster gets that mean move. A
+# cluster is a connected body joined with every body it has a detected self-contact pair with this step, so every
+# pair lies inside one cluster and the shared move cannot close any of them.
+
+
+@wp.kernel
+def comoving_reset_cluster_labels(labels: wp.array[wp.int32]):
+    g = wp.tid()
+    labels[g] = g
+
+
+@wp.kernel
+def comoving_join_vertex_triangle_clusters(
+    collision_info_array: wp.array[TriMeshCollisionInfo],
+    tri_indices: wp.array2d[wp.int32],
+    particle_group: wp.array[wp.int32],
+    labels: wp.array[wp.int32],
+):
+    """One label-propagation pass over the vertex-triangle pairs: both groups take the smaller label."""
+    vertex = wp.tid()
+    collision_info = collision_info_array[0]
+    group = particle_group[vertex]
+    for i in range(get_vertex_colliding_triangles_count(collision_info, vertex)):
+        triangle = get_vertex_colliding_triangles(collision_info, vertex, i)
+        other = particle_group[tri_indices[triangle, 0]]
+        if other != group:
+            smallest = wp.min(labels[group], labels[other])
+            wp.atomic_min(labels, group, smallest)
+            wp.atomic_min(labels, other, smallest)
+
+
+@wp.kernel
+def comoving_join_edge_edge_clusters(
+    collision_info_array: wp.array[TriMeshCollisionInfo],
+    edge_indices: wp.array2d[wp.int32],
+    particle_group: wp.array[wp.int32],
+    labels: wp.array[wp.int32],
+):
+    """One label-propagation pass over the edge-edge pairs."""
+    edge = wp.tid()
+    collision_info = collision_info_array[0]
+    group = particle_group[edge_indices[edge, 2]]
+    for i in range(get_edge_colliding_edges_count(collision_info, edge)):
+        other_edge = get_edge_colliding_edges(collision_info, edge, i)
+        if other_edge < 0:
+            continue
+        other = particle_group[edge_indices[other_edge, 2]]
+        if other != group:
+            smallest = wp.min(labels[group], labels[other])
+            wp.atomic_min(labels, group, smallest)
+            wp.atomic_min(labels, other, smallest)
+
+
+@wp.kernel
+def comoving_compress_cluster_labels(labels: wp.array[wp.int32]):
+    """Pointer jumping: follow each label to its own label."""
+    g = wp.tid()
+    labels[g] = labels[labels[g]]
+
+
+@wp.kernel
+def comoving_cluster_properties(
+    inv_mass: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    particle_group: wp.array[wp.int32],
+    labels: wp.array[wp.int32],
+    caps: wp.array[float],
+    cluster_mass: wp.array[float],
+    cluster_held: wp.array[wp.int32],
+    cluster_cap: wp.array[float],
+):
+    """Per detection: each cluster's mass and smallest cap; a fixed or inactive particle holds its cluster (no shared
+    move)."""
+    i = wp.tid()
+    c = labels[particle_group[i]]
+    if not particle_flags[i] & ParticleFlags.ACTIVE or inv_mass[i] == 0.0:
+        cluster_held[c] = 1
+        return
+    wp.atomic_add(cluster_mass, c, 1.0 / inv_mass[i])
+    if caps:
+        wp.atomic_min(cluster_cap, c, caps[i])
+
+
+@wp.kernel
+def comoving_accumulate_cluster_momentum(
+    displacement: wp.array[wp.vec3],
+    inv_mass: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    particle_group: wp.array[wp.int32],
+    labels: wp.array[wp.int32],
+    particle_count: int,
+    cluster_momentum: wp.array[wp.vec3],
+):
+    """Mass-weighted displacement sums per cluster, launched tiled. A block whose particles all lie in one cluster
+    (the usual case: a body's particles are contiguous) sums them in the block and adds once; a block spanning
+    clusters adds per particle. One atomic per particle on a handful of cluster slots would serialize."""
+    block, lane = wp.tid()
+    i = block * wp.block_dim() + lane
+    label = labels[particle_group[wp.min(i, particle_count - 1)]]
+    value = wp.vec3(0.0)
+    if i < particle_count:
+        if particle_flags[i] & ParticleFlags.ACTIVE and inv_mass[i] > 0.0:
+            value = displacement[i] / inv_mass[i]
+    lowest = wp.tile_extract(wp.tile_min(wp.tile(label)), 0)
+    highest = wp.tile_extract(wp.tile_max(wp.tile(label)), 0)
+    if lowest == highest:
+        total = wp.tile_extract(wp.tile_sum(wp.tile(value, preserve_type=True)), 0)
+        if lane == 0:
+            wp.atomic_add(cluster_momentum, lowest, total)
+    elif wp.dot(value, value) > 0.0:
+        wp.atomic_add(cluster_momentum, label, value)
+
+
+@wp.func
+def comoving_cluster_move(
+    c: int,
+    cluster_mass: wp.array[float],
+    cluster_momentum: wp.array[wp.vec3],
+    cluster_held: wp.array[wp.int32],
+    cluster_cap: wp.array[float],
+    max_displacement: float,
+):
+    """A cluster's shared move: its mean displacement, within the smallest cap of its particles (zero when held)."""
+    move = wp.vec3(0.0)
+    if cluster_held[c] == 0 and cluster_mass[c] > 0.0:
+        move = cluster_momentum[c] / cluster_mass[c]
+        limit = wp.min(max_displacement, cluster_cap[c])
+        length = wp.length(move)
+        if length > limit:
+            move = move * (limit / length)
+    return move
+
+
+@wp.kernel
+def comoving_relative_displacements(
+    displacement: wp.array[wp.vec3],
+    particle_group: wp.array[wp.int32],
+    labels: wp.array[wp.int32],
+    cluster_mass: wp.array[float],
+    cluster_momentum: wp.array[wp.vec3],
+    cluster_held: wp.array[wp.int32],
+    cluster_cap: wp.array[float],
+    move_limit: float,
+    relative: wp.array[wp.vec3],
+):
+    i = wp.tid()
+    c = labels[particle_group[i]]
+    relative[i] = displacement[i] - comoving_cluster_move(
+        c, cluster_mass, cluster_momentum, cluster_held, cluster_cap, move_limit
+    )
+
+
+@wp.kernel
+def comoving_apply_truncation_ts(
+    pos: wp.array[wp.vec3],
+    relative: wp.array[wp.vec3],
+    truncation_ts: wp.array[float],
+    particle_group: wp.array[wp.int32],
+    labels: wp.array[wp.int32],
+    cluster_mass: wp.array[float],
+    cluster_momentum: wp.array[wp.vec3],
+    cluster_held: wp.array[wp.int32],
+    cluster_cap: wp.array[float],
+    move_limit: float,
+    max_displacement: float,
+    max_displacements: wp.array[float],
+    displacement_out: wp.array[wp.vec3],
+    pos_out: wp.array[wp.vec3],
+):
+    """The cluster's shared move plus the truncated relative move, together within the particle's cap: the relative
+    move is scaled to the largest fraction ``s`` with ``|move + s rel| <= limit``. The shared move is already within
+    the smallest cap of its cluster, so ``s = 0`` always fits."""
+    i = wp.tid()
+    c = labels[particle_group[i]]
+    move = comoving_cluster_move(c, cluster_mass, cluster_momentum, cluster_held, cluster_cap, move_limit)
+    rel = relative[i] * truncation_ts[i]
+    limit = max_displacement
+    if max_displacements:
+        limit = max_displacements[i]
+    total = move + rel
+    if wp.dot(total, total) > limit * limit:
+        a = wp.dot(rel, rel)
+        b = 2.0 * wp.dot(move, rel)
+        c2 = wp.dot(move, move) - limit * limit  # <= 0
+        scale = 0.0
+        if a > 0.0:
+            scale = wp.clamp((-b + wp.sqrt(wp.max(b * b - 4.0 * a * c2, 0.0))) / (2.0 * a), 0.0, 1.0)
+        rel = rel * scale
+    displacement = move + rel
+    displacement_out[i] = displacement
+    if pos_out:
+        pos_out[i] = pos[i] + displacement
 
 
 @wp.kernel
