@@ -2701,8 +2701,17 @@ def apply_planar_truncation_parallel_by_collision(
     collision_info_array: wp.array[TriMeshCollisionInfo],
     parallel_eps: float,
     gamma: float,
+    particle_inv_mass: wp.array[float],
+    kinematic_force_only: int,
     truncation_t_out: wp.array[float],
 ):
+    """Per detected pair, stop each side short of a division plane between them (penetration-free projection).
+
+    With ``kinematic_force_only``, a side whose vertices all have zero inverse mass (kinematic: posed by the caller
+    each step) cuts no move of the other side: that pair acts through its contact force only, as particle-shape
+    contacts do. A kinematic primitive posed at the step's end may already lie past the dynamic one, and its plane
+    would then hold the dynamic side still every step.
+    """
     t_id = wp.tid()
     collision_info = collision_info_array[0]
 
@@ -2750,17 +2759,23 @@ def apply_planar_truncation_parallel_by_collision(
                     delta_e2_v2,
                 )
 
+                e1_kinematic = False
+                e2_kinematic = False
+                if kinematic_force_only != 0:
+                    e1_kinematic = particle_inv_mass[e1_v1] == 0.0 and particle_inv_mass[e1_v2] == 0.0
+                    e2_kinematic = particle_inv_mass[e2_v1] == 0.0 and particle_inv_mass[e2_v2] == 0.0
+
                 # For each, check the corresponding is_dummy entry in the vec4 is_dummy
-                if not is_dummy[0]:
+                if not is_dummy[0] and not e2_kinematic:
                     t = planar_truncation_t(e1_v1_pos, delta_e1_v1, n, d, parallel_eps, gamma)
                     wp.atomic_min(truncation_t_out, e1_v1, t)
-                if not is_dummy[1]:
+                if not is_dummy[1] and not e2_kinematic:
                     t = planar_truncation_t(e1_v2_pos, delta_e1_v2, n, d, parallel_eps, gamma)
                     wp.atomic_min(truncation_t_out, e1_v2, t)
-                if not is_dummy[2]:
+                if not is_dummy[2] and not e1_kinematic:
                     t = planar_truncation_t(e2_v1_pos, delta_e2_v1, n, d, parallel_eps, gamma)
                     wp.atomic_min(truncation_t_out, e2_v1, t)
-                if not is_dummy[3]:
+                if not is_dummy[3] and not e1_kinematic:
                     t = planar_truncation_t(e2_v2_pos, delta_e2_v2, n, d, parallel_eps, gamma)
                     wp.atomic_min(truncation_t_out, e2_v2, t)
 
@@ -2805,19 +2820,29 @@ def apply_planar_truncation_parallel_by_collision(
                     delta_t3,
                 )
 
+                vertex_kinematic = False
+                triangle_kinematic = False
+                if kinematic_force_only != 0:
+                    vertex_kinematic = particle_inv_mass[particle_idx] == 0.0
+                    triangle_kinematic = (
+                        particle_inv_mass[tri_a] == 0.0
+                        and particle_inv_mass[tri_b] == 0.0
+                        and particle_inv_mass[tri_c] == 0.0
+                    )
+
                 # planar truncation for 2 sides
-                if not is_dummy[0]:
+                if not is_dummy[0] and not triangle_kinematic:
                     t = planar_truncation_t(
                         colliding_particle_pos, colliding_particle_displacement, n, d, parallel_eps, gamma
                     )
                     wp.atomic_min(truncation_t_out, particle_idx, t)
-                if not is_dummy[1]:
+                if not is_dummy[1] and not vertex_kinematic:
                     t = planar_truncation_t(t1, delta_t1, n, d, parallel_eps, gamma)
                     wp.atomic_min(truncation_t_out, tri_a, t)
-                if not is_dummy[2]:
+                if not is_dummy[2] and not vertex_kinematic:
                     t = planar_truncation_t(t2, delta_t2, n, d, parallel_eps, gamma)
                     wp.atomic_min(truncation_t_out, tri_b, t)
-                if not is_dummy[3]:
+                if not is_dummy[3] and not vertex_kinematic:
                     t = planar_truncation_t(t3, delta_t3, n, d, parallel_eps, gamma)
                     wp.atomic_min(truncation_t_out, tri_c, t)
 

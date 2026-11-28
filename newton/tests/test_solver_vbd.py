@@ -5031,6 +5031,73 @@ def _particle_triangle_drag(test, device):
 
 add_function_test(TestSolverVBD, "test_particle_triangle_drag", _particle_triangle_drag, devices=devices)
 
+def _folded_strip(device, force_only: bool):
+    """A 10 x 4 cm strip folded over itself: the bottom layer (y = 1 m) kinematic, the free top layer 3 mm above it,
+    joined at the fold. Returns the model, solver and the bottom and top particle ids."""
+    length, width, n, m, gap = 0.10, 0.04, 20, 8, 0.003
+    xs, zs = np.linspace(0.0, length, n + 1), np.linspace(0.0, width, m + 1)
+    path = [(x, 1.0) for x in xs] + [(length, 1.0 + gap)] + [(x, 1.0 + gap) for x in xs[::-1][1:]]
+    vertices = [wp.vec3(x, y, z) for (x, y) in path for z in zs]
+    indices = []
+    for c in range(len(path) - 1):
+        for r in range(m):
+            a, b = c * (m + 1) + r, (c + 1) * (m + 1) + r
+            indices += [a, b, b + 1, a, b + 1, a + 1]
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, 0.0, 0.0))
+    builder.add_cloth_mesh(pos=wp.vec3(0.0, 0.0, 0.0), rot=wp.quat_identity(), scale=1.0, vel=wp.vec3(0.0, 0.0, 0.0),
+                           vertices=vertices, indices=indices, density=0.15, tri_ke=385.0, tri_ka=330.0, tri_kd=0.0,
+                           edge_ke=1.0e-4, particle_radius=0.0005)
+    bottom = np.arange((n + 1) * (m + 1))
+    for i in bottom:
+        builder.particle_mass[int(i)] = 0.0
+    builder.color(include_bending=True)
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverVBD(
+        model, iterations=10, particle_enable_self_contact=True, particle_self_contact_margin=0.002,
+        particle_self_contact_gap=0.002, particle_self_contact_kinematic_force_only=force_only,
+    )
+    return model, solver, bottom, np.arange((n + 2) * (m + 1), len(vertices))
+
+
+def _particle_self_contact_kinematic_force_only(test, device):
+    """``particle_self_contact_kinematic_force_only``: a kinematic surface pushes cloth through contact force only.
+
+    The kinematic layer of a folded strip is driven up into the free layer at 1.5 m/s (2.5 mm per step, more than
+    the 2 mm margin), posed at each step's end before the solve, as cloth pinned to an animated body is. With the
+    penetration-free truncation the kinematic layer lands past the free one and its division plane holds the free
+    layer behind it: the layer passes through. Force-only, the free layer is pushed ahead and rides about one margin
+    above.
+    """
+    dt, speed, steps = 1.0 / 600.0, 1.5, 60
+    lifts = {}
+    for force_only in (False, True):
+        model, solver, bottom, top = _folded_strip(device, force_only)
+        state, following, control = model.state(), model.state(), model.control()
+        start = state.particle_q.numpy().copy()
+        for k in range(steps):
+            q, qd = state.particle_q.numpy(), state.particle_qd.numpy()
+            q[bottom, 1] = start[bottom, 1] + speed * (k + 1) * dt
+            qd[bottom] = (0.0, speed, 0.0)
+            state.particle_q.assign(q)
+            state.particle_qd.assign(qd)
+            state.clear_forces()
+            solver.step(state, following, control, None, dt)
+            state, following = following, state
+        q = state.particle_q.numpy()
+        test.assertTrue(np.isfinite(q).all())
+        lifts[force_only] = q[top, 1] - (1.0 + speed * steps * dt)  # height above the kinematic layer
+    test.assertLess(float(np.median(lifts[False])), 0.0)  # passed through
+    test.assertGreater(float(lifts[True].min()), 0.001)
+    test.assertLess(float(lifts[True].max()), 0.004)
+
+
+add_function_test(
+    TestSolverVBD,
+    "test_particle_self_contact_kinematic_force_only",
+    _particle_self_contact_kinematic_force_only,
+    devices=devices,
+)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, failfast=True)
 

@@ -365,6 +365,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         particle_rigid_mode_correction: bool = False,
         particle_static_friction: bool = False,
         particle_self_contact_comoving_truncation: bool = False,
+        particle_self_contact_kinematic_force_only: bool = False,
         particle_contact_ke: np.ndarray | wp.array | None = None,
         # Rigid body - constraint formulation and stabilization
         rigid_compliant_alm: bool | None = None,  # None retains legacy and emits the scoped migration warning
@@ -509,6 +510,13 @@ class SolverVBD(SolverBase, CouplingInterface):
                 kept. A cluster with a fixed or inactive particle gets no shared move (the existing truncation), and
                 the shared plus relative move stays within each particle's limit (the speculative cap, or the fixed
                 limit).
+            particle_self_contact_kinematic_force_only: With self-contact, pairs whose one side is wholly kinematic
+                (every vertex of the triangle or edge has zero inverse mass, posed by the caller each step, e.g. cloth
+                pinned to an animated body) act through their contact force only: the kinematic side cuts no move of
+                the other in the penetration-free truncation, as particle-shape contacts do. A kinematic primitive is
+                posed at the step's end before the solve; moving faster than the contact margin per step it can land
+                past the cloth next to it, and its division plane then holds that cloth still in the world every step.
+                Pairs between dynamic particles keep the truncation.
             particle_contact_ke: Per-particle contact stiffness [N/m], one value per particle, in place of the
                 model-wide ``model.soft_contact_ke`` on the particle side. A self-contact pair (vertex-triangle or
                 edge-edge, within one body or between two) uses the harmonic mean of its two sides (each side the
@@ -910,6 +918,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             particle_static_friction,
             particle_self_contact_comoving_truncation,
             particle_contact_ke,
+            particle_self_contact_kinematic_force_only,
         )
 
         # Initialize rigid body system and rigid-particle (body-particle) interaction state
@@ -962,8 +971,10 @@ class SolverVBD(SolverBase, CouplingInterface):
         particle_static_friction: bool = False,
         particle_self_contact_comoving_truncation: bool = False,
         particle_contact_ke: np.ndarray | wp.array | None = None,
+        particle_self_contact_kinematic_force_only: bool = False,
     ):
         """Initialize particle-specific data structures and settings."""
+        self.particle_self_contact_kinematic_force_only = bool(particle_self_contact_kinematic_force_only)
         self.particle_contact_ke = None
         if particle_contact_ke is not None and model.particle_count > 0:
             values = particle_contact_ke.numpy() if isinstance(particle_contact_ke, wp.array) else particle_contact_ke
@@ -2819,6 +2830,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.trimesh_collision_info,
                     self._self_contact_edge_edge_parallel_epsilon,
                     self.particle_conservative_bound_relaxation,
+                    self.model.particle_inv_mass,
+                    int(self.particle_self_contact_kinematic_force_only),
                 ],
                 outputs=[
                     self.truncation_ts,
@@ -2885,6 +2898,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                 self.trimesh_collision_info,
                 self._self_contact_edge_edge_parallel_epsilon,
                 self.particle_conservative_bound_relaxation,
+                model.particle_inv_mass,
+                int(self.particle_self_contact_kinematic_force_only),
             ],
             outputs=[self.truncation_ts],
             dim=self.particle_self_contact_evaluation_kernel_launch_size,
